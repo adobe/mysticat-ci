@@ -1,0 +1,29 @@
+name: "Set up AWS Credentials and Fetch Secrets"
+description: "Configures AWS credentials via OIDC. Optionally fetches secrets from AWS Secrets Manager."
+
+inputs:
+  aws_role_to_assume:
+    description: "ARN of the IAM role to assume"
+    required: true
+  secret_ids:
+    description: "List of secret IDs to fetch from AWS Secrets Manager. Pass empty string to skip."
+    default: |
+      /spacecat/github-actions
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure AWS Credentials
+      id: creds
+      uses: aws-actions/configure-aws-credentials@v5
+      with:
+        aws-region: us-east-1
+        role-to-assume: ${{ inputs.aws_role_to_assume }}
+
+    - name: Fetch AWS Secrets
+      if: ${{ inputs.secret_ids != '' }}
+      uses: aws-actions/aws-secretsmanager-get-secrets@v2
+      with:
+        parse-json-secrets: true
+        secret-ids: ${{ inputs.secret_ids }}
