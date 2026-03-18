@@ -1,0 +1,214 @@
+name: Service CI
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Service name for artifact naming (e.g., jobs-dispatcher)"
+        required: true
+        type: string
+      validate-pr-title:
+        description: "Run semantic PR title validation"
+        default: false
+        type: boolean
+      docs-lint:
+        description: "Run docs:lint and docs:build in build step"
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CI_BUILD_NUM: ${{ github.run_id }}
+  CI_BRANCH: ${{ github.ref_name }}
+  HLX_AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  protect-nyc-config:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Protect NYC config
+        uses: adobe/mysticat-ci/.github/actions/protect-nyc-config@v1
+
+  validate-pr-title:
+    if: inputs.validate-pr-title && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Validate PR title
+        uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node & NPM
+        uses: adobe/mysticat-ci/.github/actions/setup-node-npm@v1
+        env:
+          MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
+
+      - name: Lint, Test, Coverage Upload
+        uses: adobe/mysticat-ci/.github/actions/lint-test-coverage@v1
+        with:
+          upload_coverage: "true"
+          codecov_token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Docs Lint
+        if: inputs.docs-lint
+        run: npm run docs:lint
+
+      - name: Docs Build
+        if: inputs.docs-lint
+        run: npm run docs:build
+
+      - name: Semantic Release (Dry Run)
+        if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+        run: npm run semantic-release-dry
+        env:
+          GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+
+  semantic-release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node & NPM
+        uses: adobe/mysticat-ci/.github/actions/setup-node-npm@v1
+        env:
+          MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
+
+      - name: Configure Environment
+        run: echo -e "LOG_LEVEL=info\n" > .env
+
+      - name: Configure AWS for PROD
+        uses: adobe/mysticat-ci/.github/actions/configure-aws@v1
+        with:
+          aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_PROD }}:role/spacecat-role-github-actions'
+
+      - name: Semantic Release
+        run: npm run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+          AWS_REGION: us-east-1
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+
+  deploy-stage:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node & NPM
+        uses: adobe/mysticat-ci/.github/actions/setup-node-npm@v1
+        env:
+          MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
+
+      - name: Configure AWS for STAGE
+        uses: adobe/mysticat-ci/.github/actions/configure-aws@v1
+        with:
+          aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_STAGE }}:role/spacecat-role-github-actions'
+          secret_ids: ''
+
+      - name: Deploy to Stage
+        run: npm run deploy-stage
+        env:
+          AWS_REGION: us-east-1
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_STAGE }}
+
+  upload-build-artifacts:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node & NPM
+        uses: adobe/mysticat-ci/.github/actions/setup-node-npm@v1
+        env:
+          MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
+
+      - name: Configure AWS for DEV
+        uses: adobe/mysticat-ci/.github/actions/configure-aws@v1
+        with:
+          aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_DEV }}:role/spacecat-role-github-actions'
+          secret_ids: ''
+
+      - name: Create Build Artifacts
+        run: npm run build
+        env:
+          AWS_REGION: us-east-1
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+
+      - name: Copy Build Artifact
+        run: cp dist/spacecat-services/${{ inputs.service-name }}@*.zip spacecat-services--${{ inputs.service-name }}-latest.zip
+
+      - name: Upload Build Artifact
+        run: aws s3 cp spacecat-services--${{ inputs.service-name }}-latest.zip s3://spacecat-artifacts-dev/spacecat-services--${{ inputs.service-name }}-latest.zip
+
+  branch-deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node & NPM
+        uses: adobe/mysticat-ci/.github/actions/setup-node-npm@v1
+        env:
+          MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
+
+      - name: Configure AWS for DEV
+        uses: adobe/mysticat-ci/.github/actions/configure-aws@v1
+        with:
+          aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_DEV }}:role/spacecat-role-github-actions'
+
+      - name: Branch Deployment
+        run: npm run deploy-dev
+        env:
+          AWS_REGION: us-east-1
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+
+      - name: Post-Deployment Integration Test
+        run: npm run test-postdeploy
+
+      - name: Upload post-deployment coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          fail_ci_if_error: false
