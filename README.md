@@ -20,3 +20,4 @@ jobs:
 | `service-name` | yes | - | Service name for artifact naming (e.g., `jobs-dispatcher`) |
 | `validate-pr-title` | no | `false` | Run semantic PR title validation |
 | `docs-lint` | no | `false` | Run `docs:lint` and `docs:build` in build step |
+
