@@ -25,7 +25,9 @@ jobs:
           echo "Moving $MAJOR tag to point at $TAG ($SHA)"
 
           # Try to update existing tag ref, or create if it doesn't exist
-          if gh api "/repos/${{ github.repository }}/git/refs/tags/$MAJOR" >/dev/null 2>&1; then
+          # NOTE: Use /git/ref/ (singular) for exact match. /git/refs/ does prefix
+          # matching and would match v1.0.0 when looking for v1, causing a false positive.
+          if gh api "/repos/${{ github.repository }}/git/ref/tags/$MAJOR" >/dev/null 2>&1; then
             gh api -X PATCH "/repos/${{ github.repository }}/git/refs/tags/$MAJOR" \
               -f sha="$SHA" -F force=true
             echo "Updated existing $MAJOR tag"
