@@ -1,0 +1,36 @@
+name: Update major version tag
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  update-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update floating major version tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          MAJOR=$(echo "$TAG" | grep -oE '^v[0-9]+')
+          if [ -z "$MAJOR" ]; then
+            echo "ERROR: Could not parse major version from tag '$TAG'"
+            exit 1
+          fi
+          SHA="${{ github.sha }}"
+          echo "Moving $MAJOR tag to point at $TAG ($SHA)"
+
+          # Try to update existing tag ref, or create if it doesn't exist
+          if gh api "/repos/${{ github.repository }}/git/refs/tags/$MAJOR" >/dev/null 2>&1; then
+            gh api -X PATCH "/repos/${{ github.repository }}/git/refs/tags/$MAJOR" \
+              -f sha="$SHA" -F force=true
+            echo "Updated existing $MAJOR tag"
+          else
+            gh api -X POST "/repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/$MAJOR" -f sha="$SHA"
+            echo "Created new $MAJOR tag"
+          fi
