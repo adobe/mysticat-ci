@@ -19,10 +19,6 @@ on:
         description: "Skip the upload-build-artifacts job"
         default: false
         type: boolean
-      it-dynamo:
-        description: "Run DynamoDB (v2) integration tests after build"
-        default: false
-        type: boolean
       it-postgres:
         description: "Run PostgreSQL (v3) integration tests after build (requires ECR access)"
         default: false
@@ -98,31 +94,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
 
-  it-dynamo:
-    runs-on: ubuntu-latest
-    needs: build
-    if: inputs.it-dynamo
-    timeout-minutes: 30
-    steps:
-      - name: Check out
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Node & NPM
-        uses: adobe/mysticat-ci/.github/actions/setup-node-npm@v1
-        env:
-          MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
-
-      - name: Run DynamoDB Integration Tests
-        run: npx mocha --require test/it/dynamo/harness.js --timeout 30000 'test/it/dynamo/**/*.test.js'
-
   it-postgres:
     runs-on: ubuntu-latest
     needs: build
@@ -153,7 +124,7 @@ jobs:
 
   semantic-release:
     runs-on: ubuntu-latest
-    needs: [build, it-dynamo, it-postgres]
+    needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'"
     steps:
       - name: Check out
@@ -184,7 +155,7 @@ jobs:
 
   deploy-stage:
     runs-on: ubuntu-latest
-    needs: [build, it-dynamo, it-postgres]
+    needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'"
     steps:
       - name: Check out
@@ -211,7 +182,7 @@ jobs:
 
   upload-build-artifacts:
     runs-on: ubuntu-latest
-    needs: [build, it-dynamo, it-postgres]
+    needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.skip-upload-artifacts"
     steps:
       - name: Check out
@@ -244,7 +215,7 @@ jobs:
 
   branch-deploy:
     runs-on: ubuntu-latest
-    needs: [build, it-dynamo, it-postgres]
+    needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref != 'refs/heads/main'"
     steps:
       - name: Check out
