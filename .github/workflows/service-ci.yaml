@@ -1,3 +1,13 @@
+# Service CI — reusable workflow called by SpaceCat / Mysticat Lambda services.
+#
+# VPC attachment: see docs/vpc-config.md for consumer enablement, environment
+# protection recommendations, rollback, and egress notes. Toggle via the
+# `vpc-enabled` input; defaults to false so existing callers are unaffected.
+#
+# Secret scope caveat: AWS_ACCOUNT_ID_DEV/_STAGE/_PROD are intentionally
+# repo-level. Do not duplicate them into the dev/stage/prod GitHub Environments
+# — environment-scoped secrets shadow repo-scoped ones of the same name and
+# could cause deploys to land in the wrong AWS account.
 name: Service CI
 
 on:
@@ -19,6 +29,25 @@ on:
         description: "Run PostgreSQL (v3) integration tests after build (requires ECR access)"
         default: false
         type: boolean
+      vpc-enabled:
+        description: >
+          Opt in to declarative VPC attachment. When true, deploy jobs run under
+          GitHub Environments (dev/stage/prod), validate that VPC_SUBNET_1/2 and
+          VPC_SG_ID are present, export them to the helix-deploy step, and assert
+          post-deploy that the Lambda picked up the expected VpcConfig. Consumers
+          must also add awsVpcSubnetIds/awsVpcSecurityGroupIds to package.json hlx.
+        default: false
+        type: boolean
+    secrets:
+      VPC_SUBNET_1:
+        description: "Private subnet ID #1 (from spacecat-infrastructure private_subnet_ids[0]). Required when vpc-enabled."
+        required: false
+      VPC_SUBNET_2:
+        description: "Private subnet ID #2. Required when vpc-enabled."
+        required: false
+      VPC_SG_ID:
+        description: "Lambda security group ID (from lambda_security_group_id). Required when vpc-enabled."
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -122,7 +151,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    environment: prod
+    environment: ${{ inputs.vpc-enabled && 'prod' || '' }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Check out
         uses: actions/checkout@v6
@@ -142,6 +174,18 @@ jobs:
         with:
           aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_PROD }}:role/spacecat-role-github-actions'
 
+      - name: Validate VPC config present
+        if: inputs.vpc-enabled
+        env:
+          VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
+          VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
+          VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
+        run: |
+          if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
+            echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'prod' environment"
+            exit 1
+          fi
+
       - name: Semantic Release
         run: npm run semantic-release
         env:
@@ -149,15 +193,34 @@ jobs:
           NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
           AWS_REGION: us-east-1
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
-          VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
-          VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
-          VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
+          VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
+          VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
+          VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
+
+      - name: Verify Lambda VPC attachment
+        if: inputs.vpc-enabled
+        env:
+          FUNC: spacecat-services--${{ inputs.service-name }}
+          EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
+          EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
+          EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
+        run: |
+          VPC=$(aws lambda get-function-configuration --function-name "$FUNC" --query 'VpcConfig' --output json)
+          echo "Applied VpcConfig for $FUNC:"
+          echo "$VPC" | jq
+          echo "$VPC" | jq -e \
+            --arg s1 "$EXPECTED_SUBNET_1" --arg s2 "$EXPECTED_SUBNET_2" --arg sg "$EXPECTED_SG" \
+            '((.SubnetIds // []) | index($s1)) and ((.SubnetIds // []) | index($s2)) and ((.SecurityGroupIds // []) | index($sg))' \
+            > /dev/null || { echo "::error::VpcConfig on $FUNC does not match expected subnets/SG"; exit 1; }
 
   deploy-stage:
     runs-on: ubuntu-latest
     needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    environment: stage
+    environment: ${{ inputs.vpc-enabled && 'stage' || '' }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Check out
         uses: actions/checkout@v6
@@ -175,20 +238,51 @@ jobs:
           aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_STAGE }}:role/spacecat-role-github-actions'
           secret_ids: ''
 
+      - name: Validate VPC config present
+        if: inputs.vpc-enabled
+        env:
+          VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
+          VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
+          VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
+        run: |
+          if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
+            echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'stage' environment"
+            exit 1
+          fi
+
       - name: Deploy to Stage
         run: npm run deploy-stage
         env:
           AWS_REGION: us-east-1
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_STAGE }}
-          VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
-          VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
-          VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
+          VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
+          VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
+          VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
+
+      - name: Verify Lambda VPC attachment
+        if: inputs.vpc-enabled
+        env:
+          FUNC: spacecat-services--${{ inputs.service-name }}
+          EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
+          EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
+          EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
+        run: |
+          VPC=$(aws lambda get-function-configuration --function-name "$FUNC" --query 'VpcConfig' --output json)
+          echo "Applied VpcConfig for $FUNC:"
+          echo "$VPC" | jq
+          echo "$VPC" | jq -e \
+            --arg s1 "$EXPECTED_SUBNET_1" --arg s2 "$EXPECTED_SUBNET_2" --arg sg "$EXPECTED_SG" \
+            '((.SubnetIds // []) | index($s1)) and ((.SubnetIds // []) | index($s2)) and ((.SecurityGroupIds // []) | index($sg))' \
+            > /dev/null || { echo "::error::VpcConfig on $FUNC does not match expected subnets/SG"; exit 1; }
 
   branch-deploy:
     runs-on: ubuntu-latest
     needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref != 'refs/heads/main'"
-    environment: dev
+    environment: ${{ inputs.vpc-enabled && 'dev' || '' }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Check out
         uses: actions/checkout@v6
@@ -205,14 +299,42 @@ jobs:
         with:
           aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_DEV }}:role/spacecat-role-github-actions'
 
+      - name: Validate VPC config present
+        if: inputs.vpc-enabled
+        env:
+          VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
+          VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
+          VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
+        run: |
+          if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
+            echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'dev' environment"
+            exit 1
+          fi
+
       - name: Branch Deployment
         run: npm run deploy-dev
         env:
           AWS_REGION: us-east-1
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
-          VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
-          VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
-          VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
+          VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
+          VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
+          VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
+
+      - name: Verify Lambda VPC attachment
+        if: inputs.vpc-enabled
+        env:
+          FUNC: spacecat-services--${{ inputs.service-name }}
+          EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
+          EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
+          EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
+        run: |
+          VPC=$(aws lambda get-function-configuration --function-name "$FUNC" --query 'VpcConfig' --output json)
+          echo "Applied VpcConfig for $FUNC:"
+          echo "$VPC" | jq
+          echo "$VPC" | jq -e \
+            --arg s1 "$EXPECTED_SUBNET_1" --arg s2 "$EXPECTED_SUBNET_2" --arg sg "$EXPECTED_SG" \
+            '((.SubnetIds // []) | index($s1)) and ((.SubnetIds // []) | index($s2)) and ((.SecurityGroupIds // []) | index($sg))' \
+            > /dev/null || { echo "::error::VpcConfig on $FUNC does not match expected subnets/SG"; exit 1; }
 
       - name: Post-Deployment Integration Test
         run: npm run test-postdeploy
