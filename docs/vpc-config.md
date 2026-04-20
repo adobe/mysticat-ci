@@ -26,17 +26,19 @@ Per environment, add these three secrets (values come from `spacecat-infrastruct
 
 ### 3. Opt in on the workflow call
 
-Add `vpc-enabled: true` and confirm `secrets: inherit`:
+Pin to `@v2`, set `vpc-enabled: true`, confirm `secrets: inherit`:
 
 ```yaml
 jobs:
   ci:
-    uses: adobe/mysticat-ci/.github/workflows/service-ci.yaml@v1
+    uses: adobe/mysticat-ci/.github/workflows/service-ci.yaml@v2
     with:
       service-name: <service>
       vpc-enabled: true
     secrets: inherit
 ```
+
+Consumers that do not need VPC attachment can stay on `@v1` indefinitely; `v2` does not deprecate `v1`, it just ships the opt-in behavior.
 
 ### 4. Reference the env vars in `package.json` hlx
 
