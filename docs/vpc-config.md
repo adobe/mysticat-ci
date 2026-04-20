@@ -74,7 +74,7 @@ Post-deploy, the `Verify Lambda VPC attachment` step waits for the AWS update to
 }
 ```
 
-Then push. `branch-deploy` will run under `environment: dev`, validate the three secrets are non-empty, deploy, and assert post-deploy that the Lambda's `VpcConfig` matches the expected subnets and SG.
+Then push. `branch-deploy` will run under `environment: dev-branches`, validate the three secrets are non-empty, deploy, and assert post-deploy that the Lambda's `VpcConfig` matches the expected subnets and SG.
 
 ## Default behavior for non-opted-in callers
 

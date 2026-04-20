@@ -190,24 +190,28 @@ jobs:
         run: |
           set -euo pipefail
           HAS_VPC_HLX=0
-          if [ -f package.json ] && grep -q '"awsVpcSubnetIds"' package.json; then
+          if [ -f package.json ] \
+             && jq -e '.hlx.awsVpcSubnetIds | arrays | length > 0' package.json >/dev/null 2>&1 \
+             && jq -e '.hlx.awsVpcSecurityGroupIds | arrays | length > 0' package.json >/dev/null 2>&1; then
             HAS_VPC_HLX=1
           fi
           if [ "$VPC_ENABLED" = "true" ]; then
-            if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
-              echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'prod' environment"
+            MISSING=()
+            [ -z "$VPC_SUBNET_1" ] && MISSING+=("VPC_SUBNET_1")
+            [ -z "$VPC_SUBNET_2" ] && MISSING+=("VPC_SUBNET_2")
+            [ -z "$VPC_SG_ID" ]    && MISSING+=("VPC_SG_ID")
+            if [ ${#MISSING[@]} -gt 0 ]; then
+              echo "::error::vpc-enabled=true but missing in the 'prod' environment: ${MISSING[*]}"
               exit 1
             fi
             if [ "$HAS_VPC_HLX" = "0" ]; then
-              echo "::error::vpc-enabled=true but package.json hlx is missing awsVpcSubnetIds. See docs/vpc-config.md."
+              echo "::error::vpc-enabled=true but package.json hlx is missing non-empty awsVpcSubnetIds or awsVpcSecurityGroupIds. See docs/vpc-config.md."
               exit 1
             fi
-            SUBNETS=2
-            SGS=1
-            echo "Applying VPC config: $SUBNETS subnets, $SGS security group(s)"
+            echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
-              echo "::error::package.json hlx references awsVpcSubnetIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
+              echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
               exit 1
             fi
           fi
@@ -226,6 +230,7 @@ jobs:
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
         env:
+          AWS_REGION: us-east-1
           FUNC: ${{ inputs.lambda-function-name != '' && inputs.lambda-function-name || format('spacecat-services--{0}', inputs.service-name) }}
           EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
@@ -276,24 +281,28 @@ jobs:
         run: |
           set -euo pipefail
           HAS_VPC_HLX=0
-          if [ -f package.json ] && grep -q '"awsVpcSubnetIds"' package.json; then
+          if [ -f package.json ] \
+             && jq -e '.hlx.awsVpcSubnetIds | arrays | length > 0' package.json >/dev/null 2>&1 \
+             && jq -e '.hlx.awsVpcSecurityGroupIds | arrays | length > 0' package.json >/dev/null 2>&1; then
             HAS_VPC_HLX=1
           fi
           if [ "$VPC_ENABLED" = "true" ]; then
-            if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
-              echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'stage' environment"
+            MISSING=()
+            [ -z "$VPC_SUBNET_1" ] && MISSING+=("VPC_SUBNET_1")
+            [ -z "$VPC_SUBNET_2" ] && MISSING+=("VPC_SUBNET_2")
+            [ -z "$VPC_SG_ID" ]    && MISSING+=("VPC_SG_ID")
+            if [ ${#MISSING[@]} -gt 0 ]; then
+              echo "::error::vpc-enabled=true but missing in the 'stage' environment: ${MISSING[*]}"
               exit 1
             fi
             if [ "$HAS_VPC_HLX" = "0" ]; then
-              echo "::error::vpc-enabled=true but package.json hlx is missing awsVpcSubnetIds. See docs/vpc-config.md."
+              echo "::error::vpc-enabled=true but package.json hlx is missing non-empty awsVpcSubnetIds or awsVpcSecurityGroupIds. See docs/vpc-config.md."
               exit 1
             fi
-            SUBNETS=2
-            SGS=1
-            echo "Applying VPC config: $SUBNETS subnets, $SGS security group(s)"
+            echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
-              echo "::error::package.json hlx references awsVpcSubnetIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
+              echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
               exit 1
             fi
           fi
@@ -310,6 +319,7 @@ jobs:
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
         env:
+          AWS_REGION: us-east-1
           FUNC: ${{ inputs.lambda-function-name != '' && inputs.lambda-function-name || format('spacecat-services--{0}', inputs.service-name) }}
           EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
@@ -362,24 +372,28 @@ jobs:
         run: |
           set -euo pipefail
           HAS_VPC_HLX=0
-          if [ -f package.json ] && grep -q '"awsVpcSubnetIds"' package.json; then
+          if [ -f package.json ] \
+             && jq -e '.hlx.awsVpcSubnetIds | arrays | length > 0' package.json >/dev/null 2>&1 \
+             && jq -e '.hlx.awsVpcSecurityGroupIds | arrays | length > 0' package.json >/dev/null 2>&1; then
             HAS_VPC_HLX=1
           fi
           if [ "$VPC_ENABLED" = "true" ]; then
-            if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
-              echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'dev-branches' environment"
+            MISSING=()
+            [ -z "$VPC_SUBNET_1" ] && MISSING+=("VPC_SUBNET_1")
+            [ -z "$VPC_SUBNET_2" ] && MISSING+=("VPC_SUBNET_2")
+            [ -z "$VPC_SG_ID" ]    && MISSING+=("VPC_SG_ID")
+            if [ ${#MISSING[@]} -gt 0 ]; then
+              echo "::error::vpc-enabled=true but missing in the 'dev-branches' environment: ${MISSING[*]}"
               exit 1
             fi
             if [ "$HAS_VPC_HLX" = "0" ]; then
-              echo "::error::vpc-enabled=true but package.json hlx is missing awsVpcSubnetIds. See docs/vpc-config.md."
+              echo "::error::vpc-enabled=true but package.json hlx is missing non-empty awsVpcSubnetIds or awsVpcSecurityGroupIds. See docs/vpc-config.md."
               exit 1
             fi
-            SUBNETS=2
-            SGS=1
-            echo "Applying VPC config: $SUBNETS subnets, $SGS security group(s)"
+            echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
-              echo "::error::package.json hlx references awsVpcSubnetIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
+              echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
               exit 1
             fi
           fi
@@ -396,6 +410,7 @@ jobs:
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
         env:
+          AWS_REGION: us-east-1
           FUNC: ${{ inputs.lambda-function-name != '' && inputs.lambda-function-name || format('spacecat-services--{0}', inputs.service-name) }}
           EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
