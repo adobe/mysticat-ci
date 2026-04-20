@@ -12,11 +12,21 @@ Do all four in a single PR so the config, the code, and the deploy are coherent.
 
 ### 1. Create GitHub Environments
 
-Create `dev`, `stage`, `prod` in the consumer repo. Defaults (no protection rules) are fine to start — see "Environment protection" below for what to add after the pilot.
+Create three environments in the consumer repo — note that **feature-branch deploys use `dev-branches`, not `dev`**:
+
+| Environment     | Used by              | Triggered on                        |
+|-----------------|----------------------|-------------------------------------|
+| `dev-branches`  | `branch-deploy` job  | push to any non-main branch         |
+| `stage`         | `deploy-stage` job   | push to `main`                      |
+| `prod`          | `semantic-release`   | push to `main` (semantic-release)   |
+
+Why `dev-branches` and not `dev`: feature-branch deploys need to stay cadence-friendly. Giving them their own environment name keeps them decoupled from any future protection rules teams might want to apply to `dev` for other pipelines.
+
+Defaults (no protection rules) are fine to start — see "Environment protection" below for what to add after the pilot.
 
 ### 2. Populate environment-scoped secrets
 
-Per environment, add these three secrets (values come from `spacecat-infrastructure` Terraform outputs in the matching AWS account):
+Per environment (`dev-branches`, `stage`, `prod`), add these three secrets (values come from `spacecat-infrastructure` Terraform outputs in the matching AWS account; `dev-branches` uses the **dev** account's values):
 
 | Secret        | Source                                                  |
 |---------------|---------------------------------------------------------|
@@ -74,7 +84,7 @@ Then push. `branch-deploy` will run under `environment: dev`, validate the three
 
 The default environments are unprotected, which preserves dev cadence but means anyone with `write` on the repo can ship a feature branch to the dev AWS account. Once the pilot has soaked:
 
-- **`dev`**: optional deployment-branch policy or required reviewer for feature branches that deploy.
+- **`dev-branches`**: leave unprotected. Feature-branch deploy cadence depends on it. Gate who can push feature branches via git-side branch protection, not env protection.
 - **`stage`**: deployment-branch policy restricting to `main`.
 - **`prod`**: deployment-branch policy restricting to `main`, plus a required-reviewer rule on the environment.
 
