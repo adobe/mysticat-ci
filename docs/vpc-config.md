@@ -38,7 +38,22 @@ jobs:
     secrets: inherit
 ```
 
+Optional input: `lambda-function-name` overrides the default function-name convention (`spacecat-services--<service-name>`) used by the post-deploy verify step. Set this when the deployed Lambda name does not match the convention.
+
 Consumers that do not need VPC attachment can stay on `@v1` indefinitely; `v2` does not deprecate `v1`, it just ships the opt-in behavior.
+
+## Guardrails
+
+The `VPC config sanity check` step runs before every deploy and enforces:
+
+| `vpc-enabled` | `package.json` has `awsVpcSubnetIds` | Result |
+|---|---|---|
+| `true`        | yes                                   | proceeds (after checking secrets are populated) |
+| `true`        | no                                    | fails — workflow opt-in without hlx fields would no-op |
+| `false`       | yes                                   | fails — would silently detach VPC on deploy |
+| `false`       | no                                    | proceeds (non-VPC deploy) |
+
+Post-deploy, the `Verify Lambda VPC attachment` step waits for the AWS update to settle (`aws lambda wait function-updated`) and asserts that the applied `VpcConfig.SubnetIds` and `SecurityGroupIds` contain the expected IDs. A mismatch fails the job and surfaces the actual `VpcConfig` in the log.
 
 ### 4. Reference the env vars in `package.json` hlx
 

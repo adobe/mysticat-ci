@@ -33,11 +33,18 @@ on:
         description: >
           Opt in to declarative VPC attachment. When true, deploy jobs run under
           GitHub Environments (dev/stage/prod), validate that VPC_SUBNET_1/2 and
-          VPC_SG_ID are present, export them to the helix-deploy step, and assert
-          post-deploy that the Lambda picked up the expected VpcConfig. Consumers
-          must also add awsVpcSubnetIds/awsVpcSecurityGroupIds to package.json hlx.
+          VPC_SG_ID are present, export them to the helix-deploy step, wait for
+          the Lambda update to settle, and assert post-deploy that the Lambda
+          picked up the expected VpcConfig. Consumers must also add
+          awsVpcSubnetIds/awsVpcSecurityGroupIds to package.json hlx.
         default: false
         type: boolean
+      lambda-function-name:
+        description: >
+          Optional override for the Lambda function name used by the post-deploy
+          VPC verification step. Defaults to spacecat-services--<service-name>.
+        default: ""
+        type: string
     secrets:
       VPC_SUBNET_1:
         description: "Private subnet ID #1 (from spacecat-infrastructure private_subnet_ids[0]). Required when vpc-enabled."
@@ -174,16 +181,35 @@ jobs:
         with:
           aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_PROD }}:role/spacecat-role-github-actions'
 
-      - name: Validate VPC config present
-        if: inputs.vpc-enabled
+      - name: VPC config sanity check
         env:
+          VPC_ENABLED: ${{ inputs.vpc-enabled }}
           VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
         run: |
-          if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
-            echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'prod' environment"
-            exit 1
+          set -euo pipefail
+          HAS_VPC_HLX=0
+          if [ -f package.json ] && grep -q '"awsVpcSubnetIds"' package.json; then
+            HAS_VPC_HLX=1
+          fi
+          if [ "$VPC_ENABLED" = "true" ]; then
+            if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
+              echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'prod' environment"
+              exit 1
+            fi
+            if [ "$HAS_VPC_HLX" = "0" ]; then
+              echo "::error::vpc-enabled=true but package.json hlx is missing awsVpcSubnetIds. See docs/vpc-config.md."
+              exit 1
+            fi
+            SUBNETS=2
+            SGS=1
+            echo "Applying VPC config: $SUBNETS subnets, $SGS security group(s)"
+          else
+            if [ "$HAS_VPC_HLX" = "1" ]; then
+              echo "::error::package.json hlx references awsVpcSubnetIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
+              exit 1
+            fi
           fi
 
       - name: Semantic Release
@@ -200,17 +226,20 @@ jobs:
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
         env:
-          FUNC: spacecat-services--${{ inputs.service-name }}
+          FUNC: ${{ inputs.lambda-function-name != '' && inputs.lambda-function-name || format('spacecat-services--{0}', inputs.service-name) }}
           EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
         run: |
+          set -euo pipefail
+          echo "Waiting for Lambda $FUNC to finish updating..."
+          aws lambda wait function-updated --function-name "$FUNC"
           VPC=$(aws lambda get-function-configuration --function-name "$FUNC" --query 'VpcConfig' --output json)
           echo "Applied VpcConfig for $FUNC:"
           echo "$VPC" | jq
           echo "$VPC" | jq -e \
             --arg s1 "$EXPECTED_SUBNET_1" --arg s2 "$EXPECTED_SUBNET_2" --arg sg "$EXPECTED_SG" \
-            '((.SubnetIds // []) | index($s1)) and ((.SubnetIds // []) | index($s2)) and ((.SecurityGroupIds // []) | index($sg))' \
+            '((.SubnetIds // []) | index($s1) != null) and ((.SubnetIds // []) | index($s2) != null) and ((.SecurityGroupIds // []) | index($sg) != null)' \
             > /dev/null || { echo "::error::VpcConfig on $FUNC does not match expected subnets/SG"; exit 1; }
 
   deploy-stage:
@@ -238,16 +267,35 @@ jobs:
           aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_STAGE }}:role/spacecat-role-github-actions'
           secret_ids: ''
 
-      - name: Validate VPC config present
-        if: inputs.vpc-enabled
+      - name: VPC config sanity check
         env:
+          VPC_ENABLED: ${{ inputs.vpc-enabled }}
           VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
         run: |
-          if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
-            echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'stage' environment"
-            exit 1
+          set -euo pipefail
+          HAS_VPC_HLX=0
+          if [ -f package.json ] && grep -q '"awsVpcSubnetIds"' package.json; then
+            HAS_VPC_HLX=1
+          fi
+          if [ "$VPC_ENABLED" = "true" ]; then
+            if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
+              echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'stage' environment"
+              exit 1
+            fi
+            if [ "$HAS_VPC_HLX" = "0" ]; then
+              echo "::error::vpc-enabled=true but package.json hlx is missing awsVpcSubnetIds. See docs/vpc-config.md."
+              exit 1
+            fi
+            SUBNETS=2
+            SGS=1
+            echo "Applying VPC config: $SUBNETS subnets, $SGS security group(s)"
+          else
+            if [ "$HAS_VPC_HLX" = "1" ]; then
+              echo "::error::package.json hlx references awsVpcSubnetIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
+              exit 1
+            fi
           fi
 
       - name: Deploy to Stage
@@ -262,17 +310,20 @@ jobs:
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
         env:
-          FUNC: spacecat-services--${{ inputs.service-name }}
+          FUNC: ${{ inputs.lambda-function-name != '' && inputs.lambda-function-name || format('spacecat-services--{0}', inputs.service-name) }}
           EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
         run: |
+          set -euo pipefail
+          echo "Waiting for Lambda $FUNC to finish updating..."
+          aws lambda wait function-updated --function-name "$FUNC"
           VPC=$(aws lambda get-function-configuration --function-name "$FUNC" --query 'VpcConfig' --output json)
           echo "Applied VpcConfig for $FUNC:"
           echo "$VPC" | jq
           echo "$VPC" | jq -e \
             --arg s1 "$EXPECTED_SUBNET_1" --arg s2 "$EXPECTED_SUBNET_2" --arg sg "$EXPECTED_SG" \
-            '((.SubnetIds // []) | index($s1)) and ((.SubnetIds // []) | index($s2)) and ((.SecurityGroupIds // []) | index($sg))' \
+            '((.SubnetIds // []) | index($s1) != null) and ((.SubnetIds // []) | index($s2) != null) and ((.SecurityGroupIds // []) | index($sg) != null)' \
             > /dev/null || { echo "::error::VpcConfig on $FUNC does not match expected subnets/SG"; exit 1; }
 
   branch-deploy:
@@ -299,16 +350,35 @@ jobs:
         with:
           aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_DEV }}:role/spacecat-role-github-actions'
 
-      - name: Validate VPC config present
-        if: inputs.vpc-enabled
+      - name: VPC config sanity check
         env:
+          VPC_ENABLED: ${{ inputs.vpc-enabled }}
           VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
         run: |
-          if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
-            echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'dev' environment"
-            exit 1
+          set -euo pipefail
+          HAS_VPC_HLX=0
+          if [ -f package.json ] && grep -q '"awsVpcSubnetIds"' package.json; then
+            HAS_VPC_HLX=1
+          fi
+          if [ "$VPC_ENABLED" = "true" ]; then
+            if [ -z "$VPC_SUBNET_1" ] || [ -z "$VPC_SUBNET_2" ] || [ -z "$VPC_SG_ID" ]; then
+              echo "::error::vpc-enabled=true but VPC_SUBNET_1/VPC_SUBNET_2/VPC_SG_ID are not all set in the 'dev' environment"
+              exit 1
+            fi
+            if [ "$HAS_VPC_HLX" = "0" ]; then
+              echo "::error::vpc-enabled=true but package.json hlx is missing awsVpcSubnetIds. See docs/vpc-config.md."
+              exit 1
+            fi
+            SUBNETS=2
+            SGS=1
+            echo "Applying VPC config: $SUBNETS subnets, $SGS security group(s)"
+          else
+            if [ "$HAS_VPC_HLX" = "1" ]; then
+              echo "::error::package.json hlx references awsVpcSubnetIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
+              exit 1
+            fi
           fi
 
       - name: Branch Deployment
@@ -323,17 +393,20 @@ jobs:
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
         env:
-          FUNC: spacecat-services--${{ inputs.service-name }}
+          FUNC: ${{ inputs.lambda-function-name != '' && inputs.lambda-function-name || format('spacecat-services--{0}', inputs.service-name) }}
           EXPECTED_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
         run: |
+          set -euo pipefail
+          echo "Waiting for Lambda $FUNC to finish updating..."
+          aws lambda wait function-updated --function-name "$FUNC"
           VPC=$(aws lambda get-function-configuration --function-name "$FUNC" --query 'VpcConfig' --output json)
           echo "Applied VpcConfig for $FUNC:"
           echo "$VPC" | jq
           echo "$VPC" | jq -e \
             --arg s1 "$EXPECTED_SUBNET_1" --arg s2 "$EXPECTED_SUBNET_2" --arg sg "$EXPECTED_SG" \
-            '((.SubnetIds // []) | index($s1)) and ((.SubnetIds // []) | index($s2)) and ((.SecurityGroupIds // []) | index($sg))' \
+            '((.SubnetIds // []) | index($s1) != null) and ((.SubnetIds // []) | index($s2) != null) and ((.SecurityGroupIds // []) | index($sg) != null)' \
             > /dev/null || { echo "::error::VpcConfig on $FUNC does not match expected subnets/SG"; exit 1; }
 
       - name: Post-Deployment Integration Test
