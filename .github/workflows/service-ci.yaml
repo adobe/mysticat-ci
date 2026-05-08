@@ -355,9 +355,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          BEHIND=$(gh api "repos/${{ github.repository }}/compare/${{ github.ref_name }}...main" \
-            --jq '.ahead_by' 2>/dev/null || echo "-1")
-          if [ "$BEHIND" -gt 0 ]; then
+          RESPONSE=$(gh api "repos/${{ github.repository }}/compare/${{ github.ref_name }}...main" \
+            --jq '{status: .status, behind_by: .behind_by}' 2>/dev/null || echo '{"status":"unknown","behind_by":0}')
+          STATUS=$(echo "$RESPONSE" | jq -r '.status')
+          BEHIND=$(echo "$RESPONSE" | jq -r '.behind_by')
+          if [ "$STATUS" = "behind" ] || [ "$STATUS" = "diverged" ]; then
             echo "skip_deploy=true" >> "$GITHUB_OUTPUT"
             echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
             echo "::warning::Branch is $BEHIND commit(s) behind main — DEV deploy will be skipped"
