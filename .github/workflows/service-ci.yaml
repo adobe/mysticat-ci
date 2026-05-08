@@ -347,7 +347,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-      pull-requests: write
     steps:
       - name: Check if branch is up to date with main
         id: main-check
