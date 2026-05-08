@@ -347,23 +347,45 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      pull-requests: write
     steps:
+      - name: Check if branch is up to date with main
+        id: main-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BEHIND=$(gh api "repos/${{ github.repository }}/compare/${{ github.ref_name }}...main" \
+            --jq '.ahead_by' 2>/dev/null || echo "-1")
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "skip_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "::warning::Branch is $BEHIND commit(s) behind main — DEV deploy will be skipped"
+          else
+            echo "skip_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "behind_count=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out
+        if: steps.main-check.outputs.skip_deploy != 'true'
         uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Setup Node & NPM
+        if: steps.main-check.outputs.skip_deploy != 'true'
         uses: adobe/mysticat-ci/.github/actions/setup-node-npm@v1
         env:
           MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
 
       - name: Configure AWS for DEV
+        if: steps.main-check.outputs.skip_deploy != 'true'
         uses: adobe/mysticat-ci/.github/actions/configure-aws@v1
         with:
           aws_role_to_assume: 'arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID_DEV }}:role/spacecat-role-github-actions'
 
       - name: VPC config sanity check
+        if: steps.main-check.outputs.skip_deploy != 'true'
         env:
           VPC_ENABLED: ${{ inputs.vpc-enabled }}
           VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
@@ -399,6 +421,8 @@ jobs:
           fi
 
       - name: Branch Deployment
+        id: deploy
+        if: steps.main-check.outputs.skip_deploy != 'true'
         run: npm run deploy-dev
         env:
           AWS_REGION: us-east-1
@@ -408,7 +432,7 @@ jobs:
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
 
       - name: Verify Lambda VPC attachment
-        if: inputs.vpc-enabled
+        if: steps.main-check.outputs.skip_deploy != 'true' && inputs.vpc-enabled
         env:
           AWS_REGION: us-east-1
           FUNC: ${{ inputs.lambda-function-name != '' && inputs.lambda-function-name || format('spacecat-services--{0}', inputs.service-name) }}
@@ -428,11 +452,77 @@ jobs:
             > /dev/null || { echo "::error::VpcConfig on $FUNC does not match expected subnets/SG"; exit 1; }
 
       - name: Post-Deployment Integration Test
+        if: steps.main-check.outputs.skip_deploy != 'true'
         run: npm run test-postdeploy
 
       - name: Upload post-deployment coverage to Codecov
+        if: steps.main-check.outputs.skip_deploy != 'true'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/lcov.info
           fail_ci_if_error: false
+
+      - name: Update PR deploy status comment
+        if: always() && !cancelled()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKIP_DEPLOY: ${{ steps.main-check.outputs.skip_deploy }}
+          BEHIND_COUNT: ${{ steps.main-check.outputs.behind_count }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BRANCH: ${{ github.ref_name }}
+          SERVICE: ${{ inputs.service-name }}
+        run: |
+          set -euo pipefail
+          MARKER="<!-- mysticat-ci-dev-deploy -->"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          if [ "$SKIP_DEPLOY" = "true" ]; then
+            BODY="${MARKER}
+          ### :warning: DEV deploy skipped — \`${SERVICE}\`
+
+          Your branch is **${BEHIND_COUNT} commit(s) behind \`main\`**. The deploy was skipped to prevent deploying outdated code to DEV.
+
+          Click **\"Update branch\"** on this PR to sync with \`main\` and trigger a DEV deployment.
+
+          <sub>:robot: mysticat-ci · <a href=\"${RUN_URL}\">Run #${{ github.run_number }}</a> · ${TIMESTAMP}</sub>"
+          elif [ "$DEPLOY_OUTCOME" = "success" ]; then
+            BODY="${MARKER}
+          ### :white_check_mark: Deployed to DEV — \`${SERVICE}\`
+
+          Branch \`${BRANCH}\` was successfully deployed to **DEV** at ${TIMESTAMP}.
+
+          <sub>:robot: mysticat-ci · <a href=\"${RUN_URL}\">Run #${{ github.run_number }}</a></sub>"
+          elif [ "$DEPLOY_OUTCOME" = "failure" ]; then
+            BODY="${MARKER}
+          ### :x: DEV deploy failed — \`${SERVICE}\`
+
+          The deploy to DEV failed. Check the [workflow run](${RUN_URL}) for details.
+
+          <sub>:robot: mysticat-ci · <a href=\"${RUN_URL}\">Run #${{ github.run_number }}</a> · ${TIMESTAMP}</sub>"
+          else
+            echo "No deploy was attempted and branch is up to date — skipping comment"
+            exit 0
+          fi
+
+          PR_NUMBER=$(gh pr list --head "$BRANCH" --repo "${{ github.repository }}" \
+            --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR found for branch ${BRANCH} — skipping comment"
+            exit 0
+          fi
+
+          EXISTING_COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" 2>/dev/null | head -1)
+
+          if [ -n "$EXISTING_COMMENT_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${EXISTING_COMMENT_ID}" \
+              -X PATCH -f body="$BODY"
+            echo "Updated existing comment #${EXISTING_COMMENT_ID} on PR #${PR_NUMBER}"
+          else
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$BODY"
+            echo "Created new comment on PR #${PR_NUMBER}"
+          fi
