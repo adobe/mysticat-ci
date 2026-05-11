@@ -353,9 +353,11 @@ jobs:
         id: main-check
         env:
           GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          RESPONSE=$(gh api "repos/${{ github.repository }}/compare/main...${{ github.ref_name }}" \
+          RESPONSE=$(gh api "repos/${REPO}/compare/main...${REF_NAME}" \
             --jq '{status: .status, behind_by: .behind_by}' 2>/dev/null || echo '{"status":"unknown","behind_by":0}')
           STATUS=$(echo "$RESPONSE" | jq -r '.status')
           BEHIND=$(echo "$RESPONSE" | jq -r '.behind_by')
