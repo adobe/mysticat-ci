@@ -250,6 +250,13 @@ jobs:
           fi
 
       - name: Update NPM (OIDC requires npm >= 11.5.1)
+        # Runs AFTER the setup-node-npm composite (which has already done
+        # `npm ci` with whatever npm shipped with .nvmrc's Node version).
+        # The OIDC code path is in @semantic-release/npm — it invokes
+        # `npm publish` from the global npm, which is what gets upgraded
+        # here. npm 11's publish path is backward-compatible with a
+        # node_modules tree installed by npm 10, so this ordering is safe
+        # without restructuring the composite.
         if: inputs.npm-oidc-enabled
         run: npm install -g npm@11.13.0
 

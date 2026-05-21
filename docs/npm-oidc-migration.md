@@ -205,21 +205,206 @@ EOF
 
 ## Rollback
 
-`ADOBE_BOT_NPM_TOKEN` should be retained as an org secret for at least 2
-successful OIDC releases per consumer. To roll back:
+The contract is designed so that **every backwards transition is a single
+flag flip**. `ADOBE_BOT_NPM_TOKEN` should be retained as an org secret for
+at least 2 successful OIDC releases per consumer before rotation.
 
-1. Set `npm-oidc-enabled: false` in the caller workflow.
-2. The next release uses the legacy `NPM_TOKEN` path again (env, dry-run
-   token, no provenance) — no code changes elsewhere needed because the
-   workflow's conditionals handle both paths.
-3. The `.releaserc.cjs` `SR_NO_NPM_AUTH` guard is a no-op when the env var
-   is unset, so it stays in place harmlessly across rollback.
+### Rollback scenario A — Consumer-side rollback (after opting in)
 
-The `npm trust` bindings on npmjs.com are non-blocking for token-based
-publish, so no npm-side cleanup is required during rollback.
+Symptom: a consumer flipped `npm-oidc-enabled: true`, one or more releases
+ran on OIDC, then a regression / outage / policy reversal makes the token
+path preferable again.
 
-After 2 successful OIDC release cycles, remove `ADOBE_BOT_NPM_TOKEN` from
-the org secrets (separately, revoke the npm-side token).
+Procedure (single PR on the consumer repo):
+
+1. Edit the caller workflow: change `npm-oidc-enabled: true` → `false` (or
+   remove the input entirely — default is `false`).
+2. Merge. The next push to `main` uses the legacy `NPM_TOKEN` path
+   automatically — the workflow's conditional expressions select the
+   legacy branch when the input is unset/false:
+
+   | Knob | OIDC mode | Legacy mode (rollback) |
+   |---|---|---|
+   | `NPM_TOKEN` env on dry-run + release | `''` (empty) | `secrets.ADOBE_BOT_NPM_TOKEN` |
+   | `SR_NO_NPM_AUTH` env on dry-run | `'true'` | `''` (unset) |
+   | `NPM_CONFIG_PROVENANCE` env on release | `'true'` | `''` (unset) |
+   | `environment:` claim | `npm-publish` (or `prod` if vpc-enabled) | `prod` if vpc-enabled, else none |
+   | "Update NPM" step | runs (`npm@11.13.0`) | skipped |
+
+3. Nothing else needs reverting:
+
+   - The `.releaserc.cjs` `SR_NO_NPM_AUTH === 'true'` guard is a no-op
+     when the env var is unset. Leave it in place. (It's also still
+     compatible with the legacy path because `@semantic-release/npm`
+     loads exactly as before.)
+   - `engines.npm: >=11.5.1` in `package.json` is harmless to keep — npm
+     11 is backward-compatible with the legacy publish flow.
+   - npm trust bindings on npmjs.com are non-blocking for token-based
+     publishes. They sit there inert until you re-enable OIDC.
+   - The `npm-publish` GitHub Environment (and any branch-protection
+     tightening) is harmless to leave in place.
+
+This is intentionally a one-line rollback. Audit the OIDC failure
+(provenance issue, trust binding drift, sigstore outage, etc.) on its
+own pace after the legacy path is restored.
+
+### Rollback scenario B — mysticat-ci PR-level rollback
+
+Symptom: this PR caused a regression for a default-false consumer (no
+consumer is supposed to be affected, but if e.g. a YAML expression evaluates
+unexpectedly under legacy mode on some runner).
+
+Procedure: `git revert <merge-sha>` and cut a hotfix `v3.0.1` (or do not
+cut `v3` at all and require consumers to remain on `@v2`). Default-false
+means no consumer that hasn't explicitly opted in should be affected; if
+one is, the revert PR restores the prior `service-ci.yaml` verbatim.
+
+Backwards-compatibility surfaces audited as part of this PR (see the
+"Self-review" section below) — all default-false code paths produce
+identical behavior to the pre-PR workflow.
+
+### Rollback scenario C — Permanent revert post-rotation
+
+Symptom: all consumers migrated, `ADOBE_BOT_NPM_TOKEN` was rotated out,
+and a policy decision is made to revert to token-based publishing (very
+unlikely, but planning for it makes the OIDC adoption safer to commit to).
+
+Procedure:
+
+1. Mint a new `ADOBE_BOT_NPM_TOKEN` on npmjs.com as `adobe-bot`. Push
+   it back into the org secret store.
+2. For each consumer: revert their `npm-oidc-enabled: true` → `false`.
+3. Optionally: revoke npm trust bindings via `npm trust revoke <pkg> --id <trust-id>`
+   for cleanliness (not required — they're inert under token auth).
+
+The reusable workflow's conditional logic keeps both paths viable
+indefinitely. Removal of the legacy path (the `NPM_TOKEN` env injection
+in `service-ci.yaml`) is a separate decision; until then, every consumer
+can switch back and forth via the input.
+
+## Failure modes when `npm-oidc-enabled: true`
+
+Reference: `adobe/spacecat-shared/docs/RELEASE-RUNBOOK.md` documents the
+analogue failure modes for a directly-OIDC repo. The shapes below are
+adapted for the reusable-workflow context where there are 14 consumers.
+
+### FM-A: OIDC token exchange returns 404 (trust binding missing)
+
+Symptom in the run log:
+```
+[@semantic-release/npm] › Verifying OIDC context for publishing from GitHub Actions
+[@semantic-release/npm] › OIDC token exchange with the npm registry failed: 404 OIDC token exchange error - package not found
+[@semantic-release/npm] › Verify authentication for registry https://registry.npmjs.org/
+npm error 401 Unauthorized - GET https://registry.npmjs.org/-/whoami
+```
+
+Cause: the consumer enabled `npm-oidc-enabled: true` before registering
+the npm trust binding on npmjs.com (or the binding's `workflow_ref` /
+`environment` / `repository` doesn't match the actual workflow run claims).
+
+The 401 fallback fails because OIDC mode sets `NPM_TOKEN: ''`. This is
+intentional — failing fast surfaces the missing trust binding rather
+than silently falling back to an old token.
+
+Recovery:
+
+1. **Fastest:** flip `npm-oidc-enabled: false` in the caller workflow,
+   merge, wait for the next release. Then fix the binding in a follow-up.
+2. **Proper:** as `adobe-bot`, run `npm trust github <pkg> --repository
+   <consumer-repo> --file <caller-workflow>.yaml --environment <env> --yes`
+   for each affected package. Re-run the failed workflow.
+
+### FM-B: Sigstore unreachable mid-publish
+
+Symptom: `NPM_CONFIG_PROVENANCE: 'true'` is set, sigstore (status.sigstore.dev)
+is having an outage, the release step fails with a sigstore-related error.
+
+Cause: provenance attestations require a live signature from sigstore.
+When sigstore is down, no publish succeeds.
+
+Recovery (temporary, requires a hotfix PR on the consumer repo):
+
+1. Add an explicit override at the caller workflow level. The simplest
+   form is to inject `NPM_CONFIG_PROVENANCE: 'false'` via a `with:`
+   workaround. For now, this is not parameterized through the reusable
+   workflow — file a PR against mysticat-ci to add a `provenance-enabled`
+   input if this becomes a recurring need.
+2. Alternative: flip `npm-oidc-enabled: false` for the duration of the
+   sigstore outage. Token-based publishing has no sigstore dependency.
+
+Watch https://status.sigstore.dev/ for incidents.
+
+### FM-C: Environment approval gate stalls
+
+Symptom: release job sits at "Waiting for approval" indefinitely.
+
+Cause: the consumer's `npm-publish` (or `prod`) environment is configured
+with required reviewers, and no approver is online.
+
+Recovery: as a repo admin on the consumer repo, either approve via the
+Actions UI, OR temporarily drop the reviewer rule with:
+
+```bash
+cat <<'JSON' | gh api -X PUT repos/adobe/<consumer-repo>/environments/npm-publish --input -
+{
+  "wait_timer": 0,
+  "prevent_self_review": true,
+  "reviewers": [],
+  "deployment_branch_policy": {
+    "protected_branches": false,
+    "custom_branch_policies": true
+  }
+}
+JSON
+```
+
+The pending deployment auto-advances. Re-add reviewers afterwards if the
+policy still applies.
+
+### FM-D: Workflow / environment renamed
+
+Symptom: first release after a rename fails with `OIDC trust binding mismatch`.
+
+Cause: npm trust bindings reference `{repo, workflow_ref filename, environment}`.
+Renaming the caller workflow file, the consumer repo, or the env breaks
+all bindings registered against the old name.
+
+Recovery:
+
+1. Re-register each binding with the new name via the same `npm trust
+   github` invocation pattern, updating whichever field changed.
+2. Optionally revoke the stale bindings: `npm trust list <pkg>` to find
+   the old binding's id, then `npm trust revoke <pkg> --id <id>`.
+
+## Self-review (audit of backward compatibility)
+
+Audited as part of preparing this PR. Default-false code paths produce
+behavior identical to the pre-PR workflow:
+
+| Element | Pre-PR | Post-PR (input=false) | Post-PR (input=true) |
+|---|---|---|---|
+| `NPM_TOKEN` on dry-run env | secret value | secret value | `''` |
+| `SR_NO_NPM_AUTH` on dry-run env | unset | unset (`''` evaluates as unset for GH) | `'true'` |
+| `NPM_TOKEN` on release env | secret value | secret value | `''` |
+| `NPM_CONFIG_PROVENANCE` on release env | unset | unset (`''`) | `'true'` |
+| `environment:` claim | `'prod'` if `vpc-enabled`, else none | identical | `'prod'` if `vpc-enabled`, else `'npm-publish'` |
+| "Update NPM" step | n/a | not run (`if:` evaluates false) | runs (`npm@11.13.0`) |
+| `id-token: write` permission | already present (for AWS OIDC) | unchanged | unchanged |
+
+Notes on the `''` vs unset distinction:
+
+- GitHub Actions does set the env var to an empty string when an
+  expression evaluates to `''`. This is a minor difference from "not
+  set at all" in legacy mode.
+- `@semantic-release/npm` checks `process.env.NPM_TOKEN` truthiness;
+  `''` is falsy, so it behaves identically to unset.
+- `process.env.SR_NO_NPM_AUTH === 'true'` (strict equality) returns
+  false for both `''` and `undefined`, so the consumer's `.releaserc.cjs`
+  guard behaves identically.
+- `process.env.NPM_CONFIG_PROVENANCE` set to `''` is read by npm as
+  "config not set," same as unset.
+
+No observable behavior change for consumers who don't flip the input.
 
 ## Order of operations checklist
 
