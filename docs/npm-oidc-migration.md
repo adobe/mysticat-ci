@@ -422,6 +422,196 @@ Per consumer:
 - [ ] Verify provenance + publisher on at least one published package.
 - [ ] After 2 successful releases: rotate `ADOBE_BOT_NPM_TOKEN` out.
 
+## Release + rollout strategy
+
+This section is the **owner-side plan** for cutting `v3.0.0` of
+`adobe/mysticat-ci` and rolling it out across the 14 consumer service
+repos in a controlled, observable, reversible sequence.
+
+### Phase 0 — Cut `v3.0.0`
+
+When PR #14 merges:
+
+1. Tag the merge commit `v3.0.0`. The repo's existing `release.yaml`
+   workflow (the major-version-tag updater) will move the floating `v3`
+   tag to point at it.
+2. Optionally publish a GitHub Release with the PR's "Rollback" and
+   "Failure modes" sections inlined as release notes (reduces friction
+   for consumers reading the changelog).
+3. **Do not nudge any consumer to upgrade.** Phase 1 (canary) starts
+   only after `v3` is tagged and observable on the GitHub UI.
+
+Pre-cut checks:
+
+- [ ] CI on this PR is green.
+- [ ] At least one of: solaris007 / aniham / ramboz / iuliag / akshaymagapu
+      (or another mysticat-ci maintainer) has approved.
+- [ ] Spot-read the diff one more time — particularly the
+      `environment: ${{ (inputs.vpc-enabled && 'prod') || (inputs.npm-oidc-enabled && 'npm-publish') || '' }}`
+      precedence and the dry-run + release token expressions, because
+      a typo here breaks every consumer that opts in.
+
+### Phase 1 — Canary (1 repo, ≥ 1 week observation)
+
+Goal: prove the consumer-side recipe works end-to-end on a low-stakes
+repo before propagating.
+
+Canary selection criteria (pick ONE that satisfies all):
+
+- Active enough to actually exercise OIDC ≥ 2 times in the observation
+  window (≥ 1 release per week historically).
+- Low blast radius: if its publish breaks, downstream pain is bounded
+  to a small set of consumers.
+- Not VPC-enabled (keeps the env path as `npm-publish`, not `prod`,
+  which is the simpler path to validate first).
+- Not in a code-freeze window.
+
+Likely candidates from the 14 today, in rough order:
+
+1. `spacecat-jobs-dispatcher` — small surface, regular releases.
+2. `spacecat-task-processor` — similar profile.
+3. `mysticat-projector-service` — adjacent codebase, isolated.
+
+(If all candidates are VPC-enabled, pick the lowest-volume one and
+verify the `prod` env binding path explicitly during Phase 1.)
+
+Execute steps 1-7 of the "Order of operations checklist" on the canary.
+
+Success criteria (all must hold for ≥ 1 week before Phase 2):
+
+- ≥ 2 OIDC releases land successfully on `main`.
+- Every published version shows `_npmUser: "GitHub Actions"` (not
+  `adobe-admin`) on `npm view @adobe/<pkg> _npmUser`.
+- Every published version carries a provenance attestation:
+  `npm view @adobe/<pkg> dist.attestations` returns non-empty.
+- The SLSA attestation's `workflow.path` field points at the canary's
+  **caller** workflow (e.g. `adobe/spacecat-jobs-dispatcher/.github/workflows/main.yaml`),
+  **not** `adobe/mysticat-ci/.github/workflows/service-ci.yaml`. If it
+  points at the latter, the trust binding was registered against
+  `job_workflow_ref` instead of `workflow_ref` — fail-stop and re-register
+  before continuing.
+- No FM-A / FM-B / FM-C / FM-D incidents (see "Failure modes" section).
+- Dry-run on PRs still passes (no @semantic-release/npm errors).
+
+Rollback trigger during Phase 1: any of:
+
+- An OIDC release fails for a reason other than a transient sigstore
+  outage (FM-B).
+- The provenance attestation's `workflow.path` is wrong.
+- Adobe org-wide sigstore outage that exceeds 4 hours.
+
+Rollback procedure: flip `npm-oidc-enabled: true` → `false` in the
+canary's caller workflow, ship a follow-up PR fixing whatever broke,
+then re-enter Phase 1.
+
+### Phase 2 — Pilot batch (3 repos, ≥ 1 week observation)
+
+After Phase 1 success criteria hold for the canary, expand to a small
+batch with diversity in profile:
+
+- 1 more non-VPC service (regular publish flow).
+- 1 VPC-enabled service (validates the `--environment prod` binding path).
+- 1 service that publishes more than one package (validates the
+  per-package binding registration loop).
+
+Each pilot consumer runs the consumer-side checklist independently.
+They can run in parallel — no inter-consumer dependency in this
+migration (each consumer publishes its own packages).
+
+Success criteria: identical to Phase 1, applied per pilot consumer.
+
+Rollback trigger: if the canary or any pilot has a regression that
+isn't caught by the existing failure-mode docs, **add a new failure
+mode to the doc before continuing to Phase 3**. The doc is part of the
+forward-compatibility contract for the rollout.
+
+### Phase 3 — Bulk rollout (remaining 10 repos)
+
+Once Phases 1-2 have produced 4 successful migrations with no novel
+failure modes, the remaining consumers can migrate in parallel. Each
+repo's owner runs the consumer-side checklist on their own schedule.
+
+Coordination needed (lightweight):
+
+- A tracking issue in `adobe/mysticat-ci` listing all 14 consumers with
+  a checkbox per repo. Each owner ticks their box when their consumer
+  has ≥ 2 OIDC releases. (Recommended PR-spawned: open this issue right
+  after `v3.0.0` is tagged.)
+- A shared status doc / Slack channel for asking questions during
+  the rollout — the migration doc is the first answer, but edge cases
+  will surface.
+
+Suggested order within the bulk batch (not load-bearing, just reduces
+risk):
+
+1. Repos with current active development (catches issues fast).
+2. VPC consumers grouped together (so the `--environment prod` recipe
+   variant is exercised consistently).
+3. Lowest-volume / least-active repos last (their next release may be
+   weeks out; rolling them last avoids leaving stragglers).
+
+Success criteria: every consumer has ≥ 2 OIDC release cycles. Track
+via the tracking issue.
+
+### Phase 4 — Token decommissioning
+
+Only when every consumer has crossed the ≥ 2-cycle threshold:
+
+1. Open a PR in `adobe/mysticat-ci` removing the legacy `NPM_TOKEN` env
+   injection from `service-ci.yaml` (the conditional branches that select
+   `secrets.ADOBE_BOT_NPM_TOKEN` when `npm-oidc-enabled: false`). At this
+   point the input becomes "always-on OIDC" or a no-op flag.
+2. Delete `ADOBE_BOT_NPM_TOKEN` from the `adobe` org secrets.
+3. As `adobe-bot`, revoke the npm-side token via `npm token revoke <id>`.
+4. (Optional) cut `v4.0.0` of `mysticat-ci` to reflect the major
+   contract change (no more token fallback path).
+
+Decommissioning is *not* a rush job. Each consumer's "≥ 2 successful
+cycles" is the gating signal, not a calendar date. Tracking issue from
+Phase 3 is the source of truth.
+
+### Communication template
+
+For each consumer's owner, when their repo is up next:
+
+> Subject: Migrate `<repo>` to npm OIDC via mysticat-ci@v3
+>
+> `adobe/mysticat-ci` v3.0.0 is out, with opt-in `npm-oidc-enabled`
+> support. Migration recipe + rollback procedures are in
+> `adobe/mysticat-ci/docs/npm-oidc-migration.md`.
+>
+> Your repo is up. Steps in order:
+>   1. PR: add SR_NO_NPM_AUTH guard to `.releaserc.cjs`, bump engines.npm,
+>      pin caller workflow to `@v3` (keep flag false).
+>   2. Repo settings: create `npm-publish` env (`main`-only branch policy,
+>      `can_admins_bypass: false`), tighten branch protection.
+>   3. Coordinate with whoever has `adobe-bot` npm credentials to register
+>      trust bindings for your packages (one command per package).
+>   4. PR: flip `npm-oidc-enabled: true`. Watch the first release on main.
+>   5. After 2 successful releases, tick your box on the tracking issue.
+>
+> Rollback is one flag flip. Failure modes are documented. Ping me if
+> anything in the doc is ambiguous — the doc is part of the contract.
+
+### What can go wrong with the rollout itself (not consumer-specific)
+
+- **`v3` tag not pinned by consumers**: if a consumer pins to `@main`
+  or `@latest` (anti-pattern), they'd inherit `v3.0.0`'s behavior
+  immediately. Default-false flag means no observable change unless
+  they also opt in, so this is safe; still, repo-survey for
+  `mysticat-ci@main` pins is worth doing before tagging `v3`.
+- **Org-wide sigstore outage during rollout**: don't start a new
+  consumer's Phase 1 if sigstore is degraded. Defer until status is
+  green.
+- **`adobe-bot` npm credentials unavailable**: only one person typically
+  has these. Lock in a second operator for the rollout window so the
+  bus factor isn't 1.
+- **`ADOBE_BOT_NPM_TOKEN` rotation event mid-rollout**: if the token
+  rotates while half of consumers are on OIDC and half on token, the
+  not-yet-migrated half breaks. Coordinate with whoever owns the token
+  rotation cadence — ideally pause rotation for the rollout window, or
+  prioritize migrating the token-dependent consumers first.
+
 ## Security note: binding to reusable workflows
 
 `mysticat-ci/service-ci.yaml` is called via `workflow_call` from each
