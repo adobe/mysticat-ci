@@ -4,6 +4,12 @@
 # protection recommendations, rollback, and egress notes. Toggle via the
 # `vpc-enabled` input; defaults to false so existing callers are unaffected.
 #
+# npm OIDC publishing (Trusted Publishers): see docs/npm-oidc-migration.md
+# for per-consumer setup (engines.npm bump, SR_NO_NPM_AUTH guard, GitHub
+# Environment, branch protection, npm trust binding registration). Toggle
+# via the `npm-oidc-enabled` input; defaults to false so existing callers
+# keep token-based publishing unchanged.
+#
 # Secret scope caveat: AWS_ACCOUNT_ID_DEV/_STAGE/_PROD are intentionally
 # repo-level. Do not duplicate them into the dev/stage/prod GitHub Environments
 # — environment-scoped secrets shadow repo-scoped ones of the same name and
@@ -45,6 +51,22 @@ on:
           VPC verification step. Defaults to spacecat-services--<service-name>.
         default: ""
         type: string
+      npm-oidc-enabled:
+        description: >
+          Use npm Trusted Publishers (OIDC) for the publish path instead of
+          long-lived ADOBE_BOT_NPM_TOKEN. Required consumer prerequisites:
+            - .releaserc.cjs gates @semantic-release/npm on
+              `process.env.SR_NO_NPM_AUTH === 'true'`
+            - engines.npm >= 11.5.1 in package.json
+            - GitHub Environment 'npm-publish' (or 'prod' if vpc-enabled)
+              configured with deployment_branch_policy=main-only and
+              can_admins_bypass=false
+            - npm trust binding registered on npmjs.com for each published
+              package, scoped to THIS REPO'S workflow_ref (not mysticat-ci's
+              job_workflow_ref) and the chosen environment.
+          See docs/npm-oidc-migration.md.
+        default: false
+        type: boolean
     secrets:
       VPC_SUBNET_1:
         description: "Private subnet ID #1 (from spacecat-infrastructure private_subnet_ids[0]). Required when vpc-enabled."
@@ -124,7 +146,13 @@ jobs:
         run: npm run semantic-release-dry
         env:
           GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+          # OIDC mode: SR_NO_NPM_AUTH=true skips @semantic-release/npm (the
+          # consumer's .releaserc.cjs must gate the plugin on this env var).
+          # Legacy mode: ADOBE_BOT_NPM_TOKEN authenticates the verify step.
+          # Both paths cannot share the same secret slot — NPM_TOKEN is only
+          # injected when OIDC is disabled.
+          NPM_TOKEN: ${{ inputs.npm-oidc-enabled && '' || secrets.ADOBE_BOT_NPM_TOKEN }}
+          SR_NO_NPM_AUTH: ${{ inputs.npm-oidc-enabled && 'true' || '' }}
 
   it-postgres:
     runs-on: ubuntu-latest
@@ -158,7 +186,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    environment: ${{ inputs.vpc-enabled && 'prod' || '' }}
+    # Environment selection (precedence): vpc-enabled wins because the 'prod'
+    # env carries VPC secrets; consumers that combine OIDC + VPC bind their
+    # npm trust to --environment prod. Pure OIDC consumers (no VPC) get the
+    # dedicated 'npm-publish' env. Legacy consumers (neither flag set) run
+    # without an env claim, matching today's behavior.
+    environment: ${{ (inputs.vpc-enabled && 'prod') || (inputs.npm-oidc-enabled && 'npm-publish') || '' }}
     permissions:
       contents: read
       id-token: write
@@ -216,11 +249,21 @@ jobs:
             fi
           fi
 
+      - name: Update NPM (OIDC requires npm >= 11.5.1)
+        if: inputs.npm-oidc-enabled
+        run: npm install -g npm@11.13.0
+
       - name: Semantic Release
         run: npm run semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+          # OIDC mode: token unset; @semantic-release/npm performs OIDC token
+          # exchange via the npm-publish (or vpc-enabled 'prod') environment's
+          # main-only branch policy. NPM_CONFIG_PROVENANCE=true emits sigstore
+          # provenance attestations with every publish.
+          # Legacy mode: ADOBE_BOT_NPM_TOKEN authenticates the publish.
+          NPM_TOKEN: ${{ inputs.npm-oidc-enabled && '' || secrets.ADOBE_BOT_NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: ${{ inputs.npm-oidc-enabled && 'true' || '' }}
           AWS_REGION: us-east-1
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
