@@ -152,6 +152,15 @@ jobs:
           MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN: ${{ secrets.MYSTICAT_DATA_SERVICE_REPO_READ_TOKEN }}
 
       - name: Run PostgreSQL Integration Tests
+        # HELIX_FETCH_FORCE_HTTP1 must be set at the process level — before
+        # mocha starts — so every spacecat-shared library's @adobe/fetch
+        # context constructs in h1 mode with keepAlive:false. Without this,
+        # ~9 module-scope keep-alive Agents (data-access, rum-api-client,
+        # gpt-client, ims-client, vault-secrets, etc.) leave pooled sockets
+        # pinning the Node event loop after teardown, intermittently causing
+        # this job to hit the 15-minute timeout.
+        env:
+          HELIX_FETCH_FORCE_HTTP1: '1'
         run: npx mocha --require test/it/postgres/harness.js --timeout 30000 'test/it/postgres/**/*.test.js'
 
   semantic-release:
