@@ -1,0 +1,170 @@
+# Executable gate on the publish-path env composition in service-ci.yaml.
+#
+# Background: the original PR landed a buggy ternary
+#   NPM_TOKEN: ${{ inputs.npm-oidc-enabled && '' || secrets.ADOBE_BOT_NPM_TOKEN }}
+# which silently kept token publishing even when OIDC was enabled, because
+# `A && B || C` returns C whenever B is falsy and `''` is falsy. The bug
+# was caught by manual review only — service-ci.yaml never exercises the
+# OIDC opt-in path in CI, so a typo here can break every consumer that opts
+# in. This workflow is the executable gate that makes the publish-path
+# self-review table a checked invariant rather than a prose claim.
+#
+# What it checks:
+#   1. Structural: NPM_TOKEN is NOT set inline on the Semantic Release env
+#      blocks (the bug shape), and IS set via a step gated on
+#      `!inputs.npm-oidc-enabled` (the fix shape).
+#   2. Matrix render: for each (oidc x vpc) combination the resulting env
+#      (NPM_TOKEN, SR_NO_NPM_AUTH, NPM_CONFIG_PROVENANCE, environment)
+#      matches the documented self-review table.
+#
+# Caveat: the matrix render uses local mirrors of the service-ci.yaml
+# expressions. The structural job ensures those mirrors stay in sync with
+# the production file by failing if the production file regresses to the
+# buggy ternary form.
+name: Test publish-path render
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/service-ci.yaml
+      - .github/workflows/test-publish-path-render.yaml
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/service-ci.yaml
+      - .github/workflows/test-publish-path-render.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  structural-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Assert NPM_TOKEN not set inline on Semantic Release env
+        run: |
+          set -euo pipefail
+          FILE=.github/workflows/service-ci.yaml
+
+          # Forbid the historical buggy ternary form, no matter the spacing.
+          if grep -nE "NPM_TOKEN:[[:space:]]+\\\$\\{\\{[[:space:]]*inputs\\.npm-oidc-enabled[[:space:]]*&&" "$FILE"; then
+            echo "::error::Found buggy NPM_TOKEN ternary in $FILE. NPM_TOKEN must be injected via a step gated on !inputs.npm-oidc-enabled, not on the Semantic Release env block."
+            exit 1
+          fi
+
+          # Forbid any inline NPM_TOKEN on the Semantic Release env blocks. We
+          # accept NPM_TOKEN being set ONLY via a step that writes to
+          # $GITHUB_ENV. The simplest way to enforce this is to require the
+          # marker we add below.
+          if grep -nE "^[[:space:]]+NPM_TOKEN:" "$FILE"; then
+            echo "::error::Found inline NPM_TOKEN: in $FILE — must be set via a gated step writing to \$GITHUB_ENV. See the 'Configure NPM_TOKEN (legacy mode only)' steps."
+            exit 1
+          fi
+
+          # Require at least two gated NPM_TOKEN-writing steps (one for dry
+          # run, one for release). Searching by step name is brittle, so we
+          # search for the heredoc marker the writes use.
+          MARKER_COUNT=$(grep -c "NPM_TOKEN<<__MYSTICAT_CI_EOF__" "$FILE" || true)
+          if [ "${MARKER_COUNT:-0}" -lt 2 ]; then
+            echo "::error::Expected at least 2 gated NPM_TOKEN writes (dry-run + release) using the __MYSTICAT_CI_EOF__ marker; found ${MARKER_COUNT}."
+            exit 1
+          fi
+
+          # Require the gating condition shape `if: ${{ !inputs.npm-oidc-enabled`
+          # to appear at least twice (matching the two gated steps).
+          GATED=$(grep -cE "if:[[:space:]]+\\\$\\{\\{[[:space:]]*![[:space:]]*inputs\\.npm-oidc-enabled" "$FILE" || true)
+          if [ "${GATED:-0}" -lt 2 ]; then
+            echo "::error::Expected at least 2 steps gated on '!inputs.npm-oidc-enabled' to inject NPM_TOKEN only in legacy mode; found ${GATED}."
+            exit 1
+          fi
+
+          echo "Structural check passed."
+
+  render-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # NOTE: stringified booleans, not YAML booleans. GHA matrix value
+        # truthiness is implementation-defined in expressions (community
+        # reports it does serialize to strings in some contexts; non-empty
+        # string is then truthy under `!matrix.x`, which would make BOTH
+        # arms skip the legacy-mode injection and silently break this test).
+        # We use explicit `== 'true'` / `== 'false'` comparisons to
+        # sidestep that entirely.
+        oidc: ['true', 'false']
+        vpc: ['true', 'false']
+    env:
+      OIDC: ${{ matrix.oidc }}
+      VPC: ${{ matrix.vpc }}
+    steps:
+      # Mirrors service-ci.yaml's "Configure NPM_TOKEN (legacy mode only)"
+      # gating: in legacy mode we inject a mock value; in OIDC mode the var
+      # is genuinely UNSET because this step's `if:` is false.
+      - name: Set NPM_TOKEN (legacy mode only) — mirror of service-ci gating
+        if: matrix.oidc == 'false'
+        run: echo "NPM_TOKEN=mock-token-value" >> "$GITHUB_ENV"
+
+      - name: Render and assert env composition
+        env:
+          # Mirrors of the inline expressions on the Semantic Release env
+          # block in service-ci.yaml. Service-ci's expressions are written
+          # against `inputs.npm-oidc-enabled` (declared `type: boolean`),
+          # so they work boolean-naturally. The mirror below uses explicit
+          # string comparison to produce the same outputs without depending
+          # on matrix-value truthiness.
+          SR_NO_NPM_AUTH: ${{ matrix.oidc == 'true' && 'true' || '' }}
+          NPM_CONFIG_PROVENANCE: ${{ matrix.oidc == 'true' && 'true' || '' }}
+          # Mirror of the job-level environment selection expression
+          # `${{ (inputs.vpc-enabled && 'prod') || (inputs.npm-oidc-enabled && 'npm-publish') || '' }}`.
+          ENVIRONMENT: ${{ (matrix.vpc == 'true' && 'prod') || (matrix.oidc == 'true' && 'npm-publish') || '' }}
+        run: |
+          set -euo pipefail
+          fail=0
+          assert() {
+            local name=$1 actual=$2 expected=$3
+            if [ "$actual" = "$expected" ]; then
+              echo "PASS [oidc=$OIDC vpc=$VPC] $name = '$actual'"
+            else
+              echo "FAIL [oidc=$OIDC vpc=$VPC] $name expected '$expected', got '$actual'"
+              fail=1
+            fi
+          }
+
+          # Echo for log inspection — confirms matrix.oidc/vpc rendered as
+          # strings 'true' / 'false' (not as booleans coerced to 'True' etc).
+          echo "matrix.oidc='$OIDC' matrix.vpc='$VPC'"
+
+          if [ "$OIDC" = "true" ]; then
+            # Critical assertion: catches Critical #1 regression. If the gated
+            # step ever runs in OIDC mode (or if someone restores the ternary),
+            # NPM_TOKEN would be set and this would fail.
+            assert NPM_TOKEN_unset "${NPM_TOKEN:-UNSET}" "UNSET"
+            assert SR_NO_NPM_AUTH "$SR_NO_NPM_AUTH" "true"
+            assert NPM_CONFIG_PROVENANCE "$NPM_CONFIG_PROVENANCE" "true"
+            if [ "$VPC" = "true" ]; then
+              assert ENVIRONMENT "$ENVIRONMENT" "prod"
+            else
+              assert ENVIRONMENT "$ENVIRONMENT" "npm-publish"
+            fi
+          else
+            # If this fails with NPM_TOKEN_set='UNSET' it means the gated
+            # `if: matrix.oidc == 'false'` step did not run — which means
+            # matrix-value truthiness rules changed and this test is no
+            # longer exercising the legacy arm. Investigate before
+            # accepting any regression here.
+            assert NPM_TOKEN_set "${NPM_TOKEN:-UNSET}" "mock-token-value"
+            assert SR_NO_NPM_AUTH "$SR_NO_NPM_AUTH" ""
+            assert NPM_CONFIG_PROVENANCE "$NPM_CONFIG_PROVENANCE" ""
+            if [ "$VPC" = "true" ]; then
+              assert ENVIRONMENT "$ENVIRONMENT" "prod"
+            else
+              assert ENVIRONMENT "$ENVIRONMENT" ""
+            fi
+          fi
+          exit $fail

@@ -31,12 +31,22 @@ with:
 
 When `npm-oidc-enabled: true`:
 
-- Dry-run runs with `SR_NO_NPM_AUTH=true` and no `NPM_TOKEN`.
-- Release runs with `NPM_CONFIG_PROVENANCE=true`, no `NPM_TOKEN`, and
+- Dry-run runs with `SR_NO_NPM_AUTH=true` and `NPM_TOKEN` genuinely unset
+  (the legacy-mode `NPM_TOKEN` injection step is skipped). The fact that
+  it is unset and not the empty string matters: an empty `NPM_TOKEN` can
+  suppress OIDC fallback in some npm releases.
+- Release runs with `NPM_CONFIG_PROVENANCE=true`, `NPM_TOKEN` unset, and
   `environment: npm-publish` (or `prod` if `vpc-enabled: true` — see
   environment selection below).
+- An OIDC preflight step asserts the GitHub Environment exists with a
+  main-only `deployment_branch_policy` before publish — failing fast if
+  the consumer-side env-protection setup is missing.
 - An "Update NPM" step installs `npm@11.13.0` to satisfy the OIDC floor
-  (`npm >= 11.5.1`).
+  (`npm >= 11.5.1`), with a retry loop and an explicit version assertion
+  so a silently-failed upgrade cannot publish under an unsupported npm.
+- A "Verify OIDC publish identity" step asserts the latest publish's
+  `_npmUser` is `"GitHub Actions"`, failing loud if a token publish
+  somehow occurred.
 
 When `npm-oidc-enabled: false` (default): unchanged. Existing consumers
 keep token-based publishing until they explicitly opt in.
@@ -93,12 +103,26 @@ jobs:
 Settings → Environments → `New environment` → name `npm-publish`. Configure:
 
 - **`can_admins_bypass: false`** — admins must NOT be able to skip the env policy.
-- **Deployment branch policy** → selected branches → add `main`.
+- **Deployment branch policy** → selected branches → add `main`. The
+  reusable workflow's OIDC preflight asserts that **only** `main` is
+  allowed; adding additional branches (e.g. `release/*`) will fail the
+  preflight even if `main` is also present.
 - Required reviewers: optional. See "Reviewer policy" below.
 
-VPC consumers should add `main` to their existing `prod` environment's
-branch policy (or accept that `prod` already has it) — the OIDC binding
-will use `--environment prod` instead of `npm-publish`.
+VPC consumers should ensure `main` is the only entry on their existing
+`prod` environment's branch policy — the OIDC binding will use
+`--environment prod` instead of `npm-publish`. If `prod` already permits
+additional branches for AWS deploy reasons, this is incompatible with
+the OIDC security model and the consumer should either split into a
+separate env or restrict `prod` to `main`-only.
+
+**Token permission requirement for the preflight check:**
+`ADOBE_BOT_GITHUB_TOKEN` (used by the reusable workflow to read the
+consumer's env settings during the OIDC preflight) needs at least
+`Administration: read` on the consumer repo — the `/environments`
+endpoints are NOT readable with `repo` scope alone on fine-grained PATs.
+If the preflight fails with a 403/404 on a freshly-created env, the
+token's permission level is the first thing to verify.
 
 ### 5. Tighten branch protection on `main`
 
@@ -185,7 +209,9 @@ To run without a reviewer gate (typical):
 - The OIDC token's `environment` claim is still server-enforced via the
   `main`-only `deployment_branch_policy`.
 
-To add a reviewer gate later:
+To add a reviewer gate later (note: the `PUT environments` API replaces
+the entire `deployment_branch_policy`, so `main` must be re-added
+explicitly afterwards):
 
 ```bash
 cat <<'EOF' | gh api -X PUT repos/adobe/<your-repo>/environments/npm-publish --input -
@@ -199,6 +225,10 @@ cat <<'EOF' | gh api -X PUT repos/adobe/<your-repo>/environments/npm-publish --i
   }
 }
 EOF
+
+# Re-add 'main' to the custom branch list (cleared by the PUT above):
+gh api -X POST "repos/adobe/<your-repo>/environments/npm-publish/deployment-branch-policies" \
+  -f name=main
 ```
 
 `prevent_self_review` MUST be `true` whenever `reviewers` is non-empty.
@@ -206,8 +236,13 @@ EOF
 ## Rollback
 
 The contract is designed so that **every backwards transition is a single
-flag flip**. `ADOBE_BOT_NPM_TOKEN` should be retained as an org secret for
-at least 2 successful OIDC releases per consumer before rotation.
+flag flip**. `ADOBE_BOT_NPM_TOKEN` should be retained as an org secret
+for at least 2 successful OIDC releases per consumer before rotation —
+but see the Phase 4 forcing function: laggards who fail to migrate by
+the deadline (target date + 60 days) have the secret revoked regardless
+of whether they crossed the per-consumer 2-cycle threshold. The 2-cycle
+gate is the preferred signal; the deadline is the backstop that prevents
+the rollout from stalling indefinitely.
 
 ### Rollback scenario A — Consumer-side rollback (after opting in)
 
@@ -225,11 +260,13 @@ Procedure (single PR on the consumer repo):
 
    | Knob | OIDC mode | Legacy mode (rollback) |
    |---|---|---|
-   | `NPM_TOKEN` env on dry-run + release | `''` (empty) | `secrets.ADOBE_BOT_NPM_TOKEN` |
+   | `NPM_TOKEN` env on dry-run + release | UNSET (gated step skipped) | injected via `$GITHUB_ENV` from `secrets.ADOBE_BOT_NPM_TOKEN` |
    | `SR_NO_NPM_AUTH` env on dry-run | `'true'` | `''` (unset) |
    | `NPM_CONFIG_PROVENANCE` env on release | `'true'` | `''` (unset) |
    | `environment:` claim | `npm-publish` (or `prod` if vpc-enabled) | `prod` if vpc-enabled, else none |
-   | "Update NPM" step | runs (`npm@11.13.0`) | skipped |
+   | "Update NPM" step | runs (`npm@11.13.0`, version-asserted) | skipped |
+   | OIDC preflight | runs (env policy + npm floor) | skipped |
+   | "Verify OIDC publish identity" | runs (`_npmUser` must be `"GitHub Actions"`) | skipped |
 
 3. Nothing else needs reverting:
 
@@ -278,9 +315,12 @@ Procedure:
    for cleanliness (not required — they're inert under token auth).
 
 The reusable workflow's conditional logic keeps both paths viable
-indefinitely. Removal of the legacy path (the `NPM_TOKEN` env injection
-in `service-ci.yaml`) is a separate decision; until then, every consumer
-can switch back and forth via the input.
+**until Phase 4** (token decommissioning). The dual-path window is
+intentionally finite — see the Phase 4 forcing function below for the
+commitment and the laggard policy that ensures the legacy `NPM_TOKEN`
+env injection is removed rather than carried as permanent tech debt.
+Until Phase 4 lands, every consumer can switch back and forth via the
+input.
 
 ## Failure modes when `npm-oidc-enabled: true`
 
@@ -302,9 +342,13 @@ Cause: the consumer enabled `npm-oidc-enabled: true` before registering
 the npm trust binding on npmjs.com (or the binding's `workflow_ref` /
 `environment` / `repository` doesn't match the actual workflow run claims).
 
-The 401 fallback fails because OIDC mode sets `NPM_TOKEN: ''`. This is
-intentional — failing fast surfaces the missing trust binding rather
-than silently falling back to an old token.
+The 401 fallback fails because OIDC mode leaves `NPM_TOKEN` UNSET (the
+legacy-mode injection step is gated on `!inputs.npm-oidc-enabled`, so it
+is skipped). The variable is genuinely absent — not an empty string — to
+remove any chance that `@semantic-release/npm` interprets `""` as
+"authenticate with the empty token" and bypasses the OIDC fallback. The
+fail-fast behavior is the intent: a missing trust binding surfaces
+immediately rather than silently regressing to token publishing.
 
 Recovery:
 
@@ -322,17 +366,22 @@ is having an outage, the release step fails with a sigstore-related error.
 Cause: provenance attestations require a live signature from sigstore.
 When sigstore is down, no publish succeeds.
 
-Recovery (temporary, requires a hotfix PR on the consumer repo):
+Recovery (preferred, single flag flip):
 
-1. Add an explicit override at the caller workflow level. The simplest
-   form is to inject `NPM_CONFIG_PROVENANCE: 'false'` via a `with:`
-   workaround. For now, this is not parameterized through the reusable
-   workflow — file a PR against mysticat-ci to add a `provenance-enabled`
-   input if this becomes a recurring need.
-2. Alternative: flip `npm-oidc-enabled: false` for the duration of the
-   sigstore outage. Token-based publishing has no sigstore dependency.
+1. **Primary:** flip `npm-oidc-enabled: true` → `false` in the consumer's
+   caller workflow and merge. Token-based publishing has no sigstore
+   dependency. When sigstore is back, flip the flag back to `true`.
+2. **Alternative (if and only if the legacy token has been decommissioned
+   in this consumer):** open a PR against `adobe/mysticat-ci` to add a
+   `provenance-enabled` input that gates `NPM_CONFIG_PROVENANCE`. Today
+   no such input exists; do NOT attempt to set `NPM_CONFIG_PROVENANCE` via
+   `with:` — the reusable workflow does not accept it and the override
+   would silently no-op.
 
-Watch https://status.sigstore.dev/ for incidents.
+Watch https://status.sigstore.dev/ for incidents. If FM-B becomes
+recurring rather than rare, prioritize landing the `provenance-enabled`
+input (tracked as a follow-up) so the flip-back is per-incident rather
+than per-consumer.
 
 ### FM-C: Environment approval gate stalls
 
@@ -342,7 +391,10 @@ Cause: the consumer's `npm-publish` (or `prod`) environment is configured
 with required reviewers, and no approver is online.
 
 Recovery: as a repo admin on the consumer repo, either approve via the
-Actions UI, OR temporarily drop the reviewer rule with:
+Actions UI, OR temporarily drop the reviewer rule. **Important:** the
+`PUT environments` API replaces the entire `deployment_branch_policy`
+object, so you must re-state the `main` allowance — omitting it leaves
+the env accepting publishes from any branch:
 
 ```bash
 cat <<'JSON' | gh api -X PUT repos/adobe/<consumer-repo>/environments/npm-publish --input -
@@ -356,10 +408,20 @@ cat <<'JSON' | gh api -X PUT repos/adobe/<consumer-repo>/environments/npm-publis
   }
 }
 JSON
+
+# Then re-add 'main' to the custom branch list (the PUT above clears it):
+gh api -X POST "repos/adobe/<consumer-repo>/environments/npm-publish/deployment-branch-policies" \
+  -f name=main
 ```
 
 The pending deployment auto-advances. Re-add reviewers afterwards if the
-policy still applies.
+policy still applies. Verify the post-recovery state with:
+
+```bash
+gh api "repos/adobe/<consumer-repo>/environments/npm-publish/deployment-branch-policies" \
+  --jq '.branch_policies[].name'
+# Expect: main
+```
 
 ### FM-D: Workflow / environment renamed
 
@@ -378,31 +440,43 @@ Recovery:
 
 ## Self-review (audit of backward compatibility)
 
-Audited as part of preparing this PR. Default-false code paths produce
-behavior identical to the pre-PR workflow:
+Re-derived after the v1-of-PR-14 round-1 review caught a critical
+publish-path defect (the `${{ inputs.npm-oidc-enabled && '' || ... }}`
+ternary returned the real token when OIDC was on). The current code
+shape uses a gated-step pattern for `NPM_TOKEN` and an explicit OIDC
+preflight, so the publish-path env table looks different from the
+original PR description's claim. Default-false code paths still produce
+behavior identical to the pre-PR workflow.
 
 | Element | Pre-PR | Post-PR (input=false) | Post-PR (input=true) |
 |---|---|---|---|
-| `NPM_TOKEN` on dry-run env | secret value | secret value | `''` |
-| `SR_NO_NPM_AUTH` on dry-run env | unset | unset (`''` evaluates as unset for GH) | `'true'` |
-| `NPM_TOKEN` on release env | secret value | secret value | `''` |
+| `NPM_TOKEN` on dry-run env | injected from secret | injected via `$GITHUB_ENV` from secret by gated step | **UNSET** (gated step skipped — variable absent, not `''`) |
+| `SR_NO_NPM_AUTH` on dry-run env | unset | unset (`''`) | `'true'` |
+| `NPM_TOKEN` on release env | injected from secret | injected via `$GITHUB_ENV` from secret by gated step | **UNSET** (gated step skipped — variable absent, not `''`) |
 | `NPM_CONFIG_PROVENANCE` on release env | unset | unset (`''`) | `'true'` |
 | `environment:` claim | `'prod'` if `vpc-enabled`, else none | identical | `'prod'` if `vpc-enabled`, else `'npm-publish'` |
-| "Update NPM" step | n/a | not run (`if:` evaluates false) | runs (`npm@11.13.0`) |
+| OIDC preflight step | n/a | not run (`if:` false) | runs (env policy + npm floor) |
+| "Update NPM" step | n/a | not run (`if:` false) | runs (`npm@11.13.0`, retry + version assertion) |
+| "Verify OIDC publish identity" step | n/a | not run (`if:` false) | runs (`_npmUser` must be `"GitHub Actions"`) |
 | `id-token: write` permission | already present (for AWS OIDC) | unchanged | unchanged |
 
-Notes on the `''` vs unset distinction:
+Notes:
 
-- GitHub Actions does set the env var to an empty string when an
-  expression evaluates to `''`. This is a minor difference from "not
-  set at all" in legacy mode.
-- `@semantic-release/npm` checks `process.env.NPM_TOKEN` truthiness;
-  `''` is falsy, so it behaves identically to unset.
+- **UNSET vs `''` matters.** OIDC mode leaves `NPM_TOKEN` genuinely
+  absent from the environment, not empty-string. There is evidence in
+  npm's recent releases that an empty `NPM_TOKEN` can suppress OIDC
+  fallback (npm tries the empty token rather than falling back to OIDC),
+  so the gated-step pattern is correct under both readings and the
+  ternary form is not.
 - `process.env.SR_NO_NPM_AUTH === 'true'` (strict equality) returns
   false for both `''` and `undefined`, so the consumer's `.releaserc.cjs`
   guard behaves identically.
 - `process.env.NPM_CONFIG_PROVENANCE` set to `''` is read by npm as
   "config not set," same as unset.
+- The structural `NPM_TOKEN`-shape and the matrix render assertions are
+  enforced by `.github/workflows/test-publish-path-render.yaml`, which
+  fails CI on this repo if a regression to the ternary form (or any
+  inline `NPM_TOKEN:` on the Semantic Release env block) is introduced.
 
 No observable behavior change for consumers who don't flip the input.
 
@@ -522,8 +596,10 @@ Success criteria: identical to Phase 1, applied per pilot consumer.
 
 Rollback trigger: if the canary or any pilot has a regression that
 isn't caught by the existing failure-mode docs, **add a new failure
-mode to the doc before continuing to Phase 3**. The doc is part of the
-forward-compatibility contract for the rollout.
+mode to the doc before continuing to Phase 3**. The runbook should be
+kept honest as the operational source of truth for the rollout, even
+though the enforced contract lives in the workflow and the npm trust
+binding (not the prose).
 
 ### Phase 3 — Bulk rollout (remaining 10 repos)
 
@@ -555,20 +631,45 @@ via the tracking issue.
 
 ### Phase 4 — Token decommissioning
 
-Only when every consumer has crossed the ≥ 2-cycle threshold:
+When every consumer has crossed the ≥ 2-cycle threshold, **or** when the
+Phase 4 deadline below is reached — whichever comes first:
 
 1. Open a PR in `adobe/mysticat-ci` removing the legacy `NPM_TOKEN` env
-   injection from `service-ci.yaml` (the conditional branches that select
-   `secrets.ADOBE_BOT_NPM_TOKEN` when `npm-oidc-enabled: false`). At this
-   point the input becomes "always-on OIDC" or a no-op flag.
+   injection from `service-ci.yaml` (the gated "Configure NPM_TOKEN
+   (legacy mode only)" steps for both dry-run and release, plus any
+   conditional branches that still reference `secrets.ADOBE_BOT_NPM_TOKEN`).
+   At this point the input becomes "always-on OIDC" or a no-op flag.
 2. Delete `ADOBE_BOT_NPM_TOKEN` from the `adobe` org secrets.
 3. As `adobe-bot`, revoke the npm-side token via `npm token revoke <id>`.
-4. (Optional) cut `v4.0.0` of `mysticat-ci` to reflect the major
-   contract change (no more token fallback path).
+4. Cut `v4.0.0` of `mysticat-ci` to reflect the major contract change
+   (no more token fallback path) and to give consumers a discrete signal
+   to pin against.
 
-Decommissioning is *not* a rush job. Each consumer's "≥ 2 successful
-cycles" is the gating signal, not a calendar date. Tracking issue from
-Phase 3 is the source of truth.
+#### Phase 4 forcing function
+
+Deadline-free voluntary migrations across many owners reliably stall
+with a long tail; left unchecked, that tail blocks token deletion
+forever and leaves the org carrying both publish paths plus a long-lived
+secret. To prevent that, Phase 4 has a hard target:
+
+- **Target date: `v3.0.0` tag date + 3 months.** The expectation is that
+  every consumer is on OIDC by then. Tracked on the Phase 3 issue with a
+  visible target date in the issue body.
+- **Laggard policy:** at target date + 30 days, the mysticat-ci owner
+  opens a follow-up PR that flips the default of `npm-oidc-enabled` from
+  `false` to `true` (cut as `v3.x.0`). Any consumer still pinning `@v3`
+  who has not migrated their server-side setup will get a fail-fast OIDC
+  preflight error on the next release rather than a silent regression —
+  that is the intended forcing function, because the failure surfaces
+  during *their* next release, not during a coordinated cutover window.
+- **Phase 4 lands at target date + 60 days regardless,** unless an
+  explicit org-level exception is filed by an unmigrated consumer's
+  owner. The exception process is a tracking-issue comment naming the
+  blocker and a new target date.
+
+Until those dates: each consumer's "≥ 2 successful cycles" is the
+preferred gating signal, and the Phase 3 tracking issue is the source of
+truth. The deadlines are the backstop.
 
 ### Communication template
 
@@ -591,7 +692,9 @@ For each consumer's owner, when their repo is up next:
 >   5. After 2 successful releases, tick your box on the tracking issue.
 >
 > Rollback is one flag flip. Failure modes are documented. Ping me if
-> anything in the doc is ambiguous — the doc is part of the contract.
+> anything in the doc is ambiguous — this doc is the operational runbook
+> and rollout plan; the enforced contract is the workflow expressions,
+> the npm trust binding, and the env's branch policy.
 
 ### What can go wrong with the rollout itself (not consumer-specific)
 
@@ -618,18 +721,34 @@ For each consumer's owner, when their repo is up next:
 consumer's caller workflow. When the reusable workflow runs, GitHub mints
 an OIDC token with two relevant claims:
 
-- `workflow_ref` — the caller's workflow path
+- `workflow_ref` — the **caller's** workflow path
   (e.g. `adobe/spacecat-api-service/.github/workflows/main.yaml@refs/heads/main`)
-- `job_workflow_ref` — the reusable workflow's path
+- `job_workflow_ref` — the **reusable** workflow's path
   (e.g. `adobe/mysticat-ci/.github/workflows/service-ci.yaml@refs/tags/v3.0.0`)
 
-npm Trusted Publishers checks both claims against the registered binding.
-**Always bind packages to `workflow_ref` (caller), not `job_workflow_ref`
-(reusable).** A binding pointing at `adobe/mysticat-ci/...` would let any
-consumer that calls the reusable workflow publish your package — that is
-not a security boundary worth keeping.
+npm Trusted Publishers authorizes against the caller's `workflow_ref`,
+not `job_workflow_ref`. The npm docs make this explicit: when a workflow
+uses `workflow_call`, *"validation checks the calling workflow's name
+instead of the workflow that actually contains the publish command"*.
+Therefore the trust binding **must** be registered against the caller
+repo + caller filename, which is exactly what
+`npm trust github --repository <consumer-repo> --file <caller-filename>`
+does.
 
-The npm CLI's `npm trust github` command binds against the caller's
-`workflow_ref` when you pass `--repository <consumer-repo> --file <caller-filename>`.
-Binding against the reusable workflow requires a different command/flow
-and should not be used for this migration.
+What if you mis-register against `adobe/mysticat-ci/service-ci.yaml`?
+The binding will fail to match at runtime — the OIDC token's `repository`
+claim is the caller's repo and its `workflow_ref` is the caller's file,
+neither of which references `mysticat-ci`. The publish step gets a 404
+and the release fails loud (see FM-A). This is **fail-closed**: a
+mis-registered binding cannot enable cross-consumer publishing, because
+the runtime claims never reference the reusable workflow's repo. The
+recipe still puts the caller-side binding form front and center because
+the caller-side binding is the only form that ever succeeds — but the
+failure mode of getting it wrong is a loud release-time error, not a
+silent cross-consumer hijack.
+
+(Earlier revisions of this doc framed the misregistration risk as
+fail-open, citing npm "checking both claims." That was inverted: npm
+checks the caller's `workflow_ref`, full stop. The actionable instruction
+— bind to caller repo + caller filename — was correct either way; the
+revised wording above describes the actual threat model.)
