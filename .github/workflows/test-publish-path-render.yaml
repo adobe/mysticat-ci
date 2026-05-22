@@ -75,8 +75,11 @@ jobs:
             exit 1
           fi
 
-          # Require the gating condition shape `if: ${{ !inputs.npm-oidc-enabled`
-          # to appear at least twice (matching the two gated steps).
+          # Require the gating condition shape   if: <expr-open> !inputs.npm-oidc-enabled
+          # (using "<expr-open>" to avoid embedding a literal "$ + { + {" in this
+          # YAML comment, which GHA would parse as an unclosed expression and
+          # fail the entire workflow at validation time).
+          # Pattern must appear at least twice (matching the two gated steps).
           GATED=$(grep -cE "if:[[:space:]]+\\\$\\{\\{[[:space:]]*![[:space:]]*inputs\\.npm-oidc-enabled" "$FILE" || true)
           if [ "${GATED:-0}" -lt 2 ]; then
             echo "::error::Expected at least 2 steps gated on '!inputs.npm-oidc-enabled' to inject NPM_TOKEN only in legacy mode; found ${GATED}."
