@@ -4,16 +4,20 @@ name: Auto Release
 # floating vN tag inline. release.yaml stays as the path for manual Releases
 # — see "vN move" below for why we don't rely on it for this workflow.
 #
-# Bump rules (from the merged PR's title, or merge subject as fallback):
-#   *!: / *!(scope):      -> major
-#   feat: / feat(scope):  -> minor
-#   anything else         -> patch
-# Suppress with [skip release] in the merge commit message.
+# Bump rules (from the merged PR's title + body, or merge subject as fallback):
+#   feat!: / fix!: / <type>(scope)!:        -> major
+#   "BREAKING CHANGE:" footer in PR body    -> major
+#   feat: / feat(scope):                    -> minor
+#   anything else                           -> patch
+# Suppress with [skip release] in either the merge commit message or the PR title.
+#
+# This workflow publishes against the LATEST major line only. Maintenance
+# releases on older lines (e.g. v1.x.x after v2 ships) must be cut manually
+# via `gh release create` from a maintainer's machine.
 
 on:
   push:
     branches: [main]
-    paths-ignore: ['**/*.md', 'docs/**', 'LICENSE']
 
 permissions:
   contents: write
@@ -25,13 +29,15 @@ concurrency:
 
 jobs:
   release:
-    if: "!contains(github.event.head_commit.message, '[skip release]')"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        # SHA-pinned (v6.0.2) — floating @v6 is mutable and would let a
+        # compromised tag run attacker code on this contents:write workflow.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Compute next tag
@@ -45,41 +51,92 @@ jobs:
         run: |
           set -euo pipefail
 
-          git fetch --force --tags origin >/dev/null
+          # Prune-tags so a tag that was force-deleted on origin (after a
+          # bad-release recovery) doesn't linger in the local clone and
+          # send us down the wrong reconcile path.
+          git fetch --force --prune --prune-tags --tags origin >/dev/null
+
+          # Sanitize untrusted strings before they ever reach a workflow-command
+          # echo. The runner parses ::notice::/::warning::/::add-mask::/etc from
+          # any step's stdout, so unescaped attacker-controllable text in echo
+          # is a real injection vector even when it's inside double quotes.
+          sanitize() {
+            printf '%s' "$1" | tr -d '\r\n' | sed 's/::/:_:/g' | cut -c1-200
+          }
 
           # Reuse existing semver tag at this SHA (re-run after partial fail).
           # Don't short-circuit — let the publish step retry the vN move.
+          # `sort -V | tail -1` for deterministic ordering when multiple tags
+          # point at the same SHA (e.g. drift left v1.4.0 and v1.4.1 both there).
           EXISTING_TAG=$(git tag --points-at "$TARGET_SHA" \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
           if [ -n "$EXISTING_TAG" ]; then
-            echo "::notice::Reconciling vN: commit already tagged $EXISTING_TAG"
+            echo "::notice::Reconciling vN: commit already tagged $(sanitize "$EXISTING_TAG")"
             { echo "tag=$EXISTING_TAG"; echo "bump=reuse"; echo "skip=false"; } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           LATEST=$(git tag -l --sort=-v:refname \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-          [ -n "$LATEST" ] || { echo "ERROR: no vN.N.N tag in repo"; exit 1; }
+          [ -n "$LATEST" ] || { echo "::error::no vN.N.N tag in repo"; exit 1; }
           MAJOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\..*/\1/')
           MINOR=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.([0-9]+)\..*/\1/')
           PATCH=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/')
 
-          # Bump source: PR title for merge commits, head subject otherwise.
-          SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MSG" | head -1)
-          PR_NUM=$(printf '%s' "$SUBJECT" | grep -oE 'Merge pull request #[0-9]+' \
-            | grep -oE '[0-9]+' | head -1 || true)
-          if [ -n "$PR_NUM" ] && PR_TITLE=$(gh pr view "$PR_NUM" --repo "$REPO" \
-              --json title --jq .title 2>/dev/null); then
+          # Resolve the merged PR by SHA via the GitHub API (NOT by parsing
+          # the commit message, which is spoofable by anyone with direct-push
+          # access — they could write "Merge pull request #999" referencing
+          # an unrelated PR with a feat!: title to force a major).
+          PR_NUM=$(gh api "/repos/$REPO/commits/$TARGET_SHA/pulls" \
+            --jq '.[] | select(.merged_at != null) | .number' 2>/dev/null \
+            | head -1 || true)
+
+          PR_TITLE=""
+          PR_BODY=""
+          if [ -n "$PR_NUM" ]; then
+            # Retry transient API failures with backoff. We do NOT silently
+            # fall back to the merge subject — that would silently downgrade
+            # a feat!: PR to a patch release during a 30-second API blip.
+            for attempt in 1 2 3; do
+              if PR_JSON=$(gh pr view "$PR_NUM" --repo "$REPO" \
+                  --json title,body 2>/dev/null); then
+                PR_TITLE=$(printf '%s' "$PR_JSON" | jq -r .title)
+                PR_BODY=$(printf '%s' "$PR_JSON" | jq -r .body)
+                break
+              fi
+              [ $attempt -lt 3 ] && sleep $((attempt * 5))
+            done
+            if [ -z "$PR_TITLE" ]; then
+              echo "::error::gh pr view #$PR_NUM failed after 3 attempts"
+              exit 1
+            fi
             BUMP_SUBJECT="$PR_TITLE"
             BUMP_SOURCE="PR #$PR_NUM title"
           else
-            BUMP_SUBJECT="$SUBJECT"
-            BUMP_SOURCE="merge subject"
-            [ -n "$PR_NUM" ] && \
-              echo "::warning::gh pr view #$PR_NUM failed; falling back to subject"
+            BUMP_SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MSG" | head -1)
+            BUMP_SOURCE="head commit subject (no PR)"
           fi
 
+          SAFE_SUBJECT=$(sanitize "$BUMP_SUBJECT")
+
+          # [skip release] hatch — check both the merge commit message (for
+          # squash merges where the subject is the PR title) and the PR title
+          # (for merge commits where head_commit.message is the auto-generated
+          # "Merge pull request #N" line). Either suppresses.
+          if printf '%s' "$HEAD_COMMIT_MSG" | grep -qF '[skip release]' \
+             || printf '%s' "$PR_TITLE" | grep -qF '[skip release]'; then
+            echo "::notice::Release suppressed by [skip release] marker"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Bump decision. Match the resolved subject (lowercase only — matches
+          # conventional-commits convention). Also honor BREAKING CHANGE: in
+          # the PR body as a major-bump trigger (per spec).
           if printf '%s' "$BUMP_SUBJECT" | grep -qE '^[a-z]+(\([^)]+\))?!:'; then
+            NEXT="v$((MAJOR+1)).0.0"; BUMP=major
+          elif [ -n "$PR_BODY" ] \
+               && printf '%s' "$PR_BODY" | grep -qE '^BREAKING[ -]CHANGE:'; then
             NEXT="v$((MAJOR+1)).0.0"; BUMP=major
           elif printf '%s' "$BUMP_SUBJECT" | grep -qE '^feat(\([^)]+\))?:'; then
             NEXT="v$MAJOR.$((MINOR+1)).0"; BUMP=minor
@@ -88,25 +145,48 @@ jobs:
             # Warn on near-miss titles that look conventional but didn't match.
             if printf '%s' "$BUMP_SUBJECT" | grep -qiE '^[[:space:]]*(feat|fix|chore|docs|test|style|refactor|perf|build|ci|revert)' \
                && ! printf '%s' "$BUMP_SUBJECT" | grep -qE '^(feat|fix|chore|docs|test|style|refactor|perf|build|ci|revert)(\([^)]+\))?!?:'; then
-              echo "::warning::Near-miss conventional prefix in \"$BUMP_SUBJECT\" — collapsed to patch"
+              echo "::warning::Near-miss conventional prefix in \"$SAFE_SUBJECT\" — collapsed to patch"
             fi
           fi
 
+          # Loud signal on major bumps — consumers pinned to @v$MAJOR don't
+          # auto-roll to v$((MAJOR+1)); they must manually update their `uses:` ref.
+          if [ "$BUMP" = "major" ]; then
+            echo "::warning::MAJOR bump $LATEST -> $NEXT: consumers pinned to v$MAJOR are NOT updated and must bump their 'uses:' refs manually."
+          fi
+
           { echo "tag=$NEXT"; echo "bump=$BUMP"; echo "skip=false"; } >> "$GITHUB_OUTPUT"
-          echo "::notice::$LATEST -> $NEXT ($BUMP) from $BUMP_SOURCE: \"$BUMP_SUBJECT\""
+          echo "::notice::$LATEST -> $NEXT ($BUMP) from $BUMP_SOURCE: \"$SAFE_SUBJECT\""
 
       - name: Publish release and move floating tag
         if: steps.t.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           NEXT_TAG: ${{ steps.t.outputs.tag }}
+          BUMP: ${{ steps.t.outputs.bump }}
           REPO: ${{ github.repository }}
           TARGET_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
+          # Defense-in-depth: validate NEXT_TAG shape before any side effects.
+          case "$NEXT_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::malformed NEXT_TAG: $NEXT_TAG"; exit 1 ;;
+          esac
+
+          # Idempotent create. If a release for NEXT_TAG already exists,
+          # verify the underlying tag points at TARGET_SHA before skipping
+          # — otherwise we'd silently publish on a drifted tag.
           if gh release view "$NEXT_TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release $NEXT_TAG already exists — skipping create."
+            TAG_SHA=$(gh api "/repos/$REPO/git/ref/tags/$NEXT_TAG" \
+              --jq .object.sha 2>/dev/null || echo "")
+            if [ "$TAG_SHA" = "$TARGET_SHA" ]; then
+              echo "Release $NEXT_TAG already exists at $TARGET_SHA — skipping create."
+            else
+              echo "::error::Tag $NEXT_TAG exists at $TAG_SHA, expected $TARGET_SHA. Drift detected."
+              exit 1
+            fi
           else
             gh release create "$NEXT_TAG" --repo "$REPO" \
               --target "$TARGET_SHA" --title "$NEXT_TAG" --generate-notes
@@ -116,8 +196,18 @@ jobs:
           # so release.yaml never fires here. We move the tag inline instead.
           # /git/ref/tags/X is exact match; /git/refs/tags/X is prefix match.
           MAJOR_TAG=$(echo "$NEXT_TAG" | grep -oE '^v[0-9]+' || true)
-          [ -n "$MAJOR_TAG" ] || { echo "ERROR: bad NEXT_TAG: $NEXT_TAG"; exit 1; }
-          if gh api "/repos/$REPO/git/ref/tags/$MAJOR_TAG" >/dev/null 2>&1; then
+          [ -n "$MAJOR_TAG" ] || { echo "::error::bad NEXT_TAG: $NEXT_TAG"; exit 1; }
+
+          # Capture the previous vN target SHA so the run log contains an
+          # explicit rollback command. This is the 3am-rollback story.
+          PREV_VN_SHA=$(gh api "/repos/$REPO/git/ref/tags/$MAJOR_TAG" \
+            --jq .object.sha 2>/dev/null || echo "")
+          if [ -n "$PREV_VN_SHA" ]; then
+            echo "::notice::Rollback if needed: gh api -X PATCH /repos/$REPO/git/refs/tags/$MAJOR_TAG -f sha=$PREV_VN_SHA -F force=true"
+          fi
+
+          echo "Moving $MAJOR_TAG -> $TARGET_SHA (was: ${PREV_VN_SHA:-<unset>})"
+          if [ -n "$PREV_VN_SHA" ]; then
             gh api -X PATCH "/repos/$REPO/git/refs/tags/$MAJOR_TAG" \
               -f sha="$TARGET_SHA" -F force=true
           else
@@ -125,7 +215,26 @@ jobs:
               -f ref="refs/tags/$MAJOR_TAG" -f sha="$TARGET_SHA"
           fi
 
+          # Read-back: confirm vN actually resolves to TARGET_SHA. Catches
+          # silent rejects (e.g. tag-protection rule that returns 200 but
+          # rejects the SHA change) and eventually-consistent ref-update races.
           ACTUAL_SHA=$(gh api "/repos/$REPO/git/ref/tags/$MAJOR_TAG" --jq .object.sha)
           [ "$ACTUAL_SHA" = "$TARGET_SHA" ] || {
-            echo "ERROR: $MAJOR_TAG points at $ACTUAL_SHA, expected $TARGET_SHA"; exit 1; }
+            echo "::error::$MAJOR_TAG points at $ACTUAL_SHA, expected $TARGET_SHA"; exit 1; }
           echo "Verified: $MAJOR_TAG -> $ACTUAL_SHA"
+
+          # Step summary — a one-screen post-mortem artifact for the operator.
+          {
+            echo "## Released $NEXT_TAG ($BUMP)"
+            echo
+            echo "- Target SHA: \`$TARGET_SHA\`"
+            echo "- Floating tag $MAJOR_TAG: \`${PREV_VN_SHA:-<unset>}\` -> \`$ACTUAL_SHA\`"
+            echo
+            if [ -n "$PREV_VN_SHA" ]; then
+              echo "Rollback:"
+              echo
+              echo '```bash'
+              echo "gh api -X PATCH /repos/$REPO/git/refs/tags/$MAJOR_TAG -f sha=$PREV_VN_SHA -F force=true"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
