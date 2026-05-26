@@ -4,6 +4,12 @@
 # protection recommendations, rollback, and egress notes. Toggle via the
 # `vpc-enabled` input; defaults to false so existing callers are unaffected.
 #
+# npm OIDC publishing (Trusted Publishers): see docs/npm-oidc-migration.md
+# for per-consumer setup (engines.npm bump, SR_NO_NPM_AUTH guard, GitHub
+# Environment, branch protection, npm trust binding registration). Toggle
+# via the `npm-oidc-enabled` input; defaults to false so existing callers
+# keep token-based publishing unchanged.
+#
 # Secret scope caveat: AWS_ACCOUNT_ID_DEV/_STAGE/_PROD are intentionally
 # repo-level. Do not duplicate them into the dev/stage/prod GitHub Environments
 # — environment-scoped secrets shadow repo-scoped ones of the same name and
@@ -45,6 +51,22 @@ on:
           VPC verification step. Defaults to spacecat-services--<service-name>.
         default: ""
         type: string
+      npm-oidc-enabled:
+        description: >
+          Use npm Trusted Publishers (OIDC) for the publish path instead of
+          long-lived ADOBE_BOT_NPM_TOKEN. Required consumer prerequisites:
+            - .releaserc.cjs gates @semantic-release/npm on
+              `process.env.SR_NO_NPM_AUTH === 'true'`
+            - engines.npm >= 11.5.1 in package.json
+            - GitHub Environment 'npm-publish' (or 'prod' if vpc-enabled)
+              configured with deployment_branch_policy=main-only and
+              can_admins_bypass=false
+            - npm trust binding registered on npmjs.com for each published
+              package, scoped to THIS REPO'S workflow_ref (not mysticat-ci's
+              job_workflow_ref) and the chosen environment.
+          See docs/npm-oidc-migration.md.
+        default: false
+        type: boolean
     secrets:
       VPC_SUBNET_1:
         description: "Private subnet ID #1 (from spacecat-infrastructure private_subnet_ids[0]). Required when vpc-enabled."
@@ -119,12 +141,45 @@ jobs:
         if: inputs.docs-lint
         run: npm run docs:build
 
+      # NPM_TOKEN is injected via $GITHUB_ENV only in legacy mode so that in OIDC
+      # mode the variable is genuinely UNSET (not the empty string). A previous
+      # form used `${{ inputs.npm-oidc-enabled && '' || secrets.ADOBE_BOT_NPM_TOKEN }}`,
+      # which is broken: GitHub Actions evaluates `A && B || C` as C whenever B
+      # is falsy, and `''` is falsy — so OIDC mode would have leaked the real
+      # token. The gated pre-step pattern is robust under both readings of how
+      # npm treats an empty NPM_TOKEN (try-the-empty-token vs. fall-back-to-OIDC).
+      - name: Configure NPM_TOKEN (legacy mode only) — dry run
+        if: ${{ !inputs.npm-oidc-enabled && github.event_name == 'push' && github.ref != 'refs/heads/main' }}
+        env:
+          ADOBE_BOT_NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+        run: |
+          # Write via env-indirection so the secret value never appears
+          # literally in the workflow body; runner masking still applies.
+          # __MYSTICAT_CI_EOF__ is the heredoc delimiter — if a future
+          # operator copies this pattern for user-supplied secrets that
+          # could contain this exact marker substring, the heredoc would
+          # terminate prematurely. npm tokens (npm_<hex>) cannot collide.
+          {
+            echo "NPM_TOKEN<<__MYSTICAT_CI_EOF__"
+            # Strip any trailing newline that some secret stores append
+            # (vault read / 1Password CLI), so the value parsed back from
+            # $GITHUB_ENV is exactly the token without surrounding whitespace.
+            printf '%s' "${ADOBE_BOT_NPM_TOKEN%$'\n'}"
+            echo
+            echo "__MYSTICAT_CI_EOF__"
+          } >> "$GITHUB_ENV"
+
       - name: Semantic Release (Dry Run)
         if: github.event_name == 'push' && github.ref != 'refs/heads/main'
         run: npm run semantic-release-dry
         env:
           GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+          # NPM_TOKEN is inherited from $GITHUB_ENV when in legacy mode (see
+          # the preceding "Configure NPM_TOKEN" step). In OIDC mode it is
+          # deliberately absent so @semantic-release/npm cannot silently
+          # fall back to token publishing. SR_NO_NPM_AUTH=true additionally
+          # skips the plugin entirely on the consumer's .releaserc.cjs guard.
+          SR_NO_NPM_AUTH: ${{ inputs.npm-oidc-enabled && 'true' || '' }}
 
   it-postgres:
     runs-on: ubuntu-latest
@@ -180,7 +235,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, it-postgres]
     if: "!failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    environment: ${{ inputs.vpc-enabled && 'prod' || '' }}
+    # Environment selection (precedence): vpc-enabled wins because the 'prod'
+    # env carries VPC secrets; consumers that combine OIDC + VPC bind their
+    # npm trust to --environment prod. Pure OIDC consumers (no VPC) get the
+    # dedicated 'npm-publish' env. Legacy consumers (neither flag set) run
+    # without an env claim, matching today's behavior.
+    environment: ${{ (inputs.vpc-enabled && 'prod') || (inputs.npm-oidc-enabled && 'npm-publish') || '' }}
     permissions:
       contents: read
       id-token: write
@@ -238,16 +298,280 @@ jobs:
             fi
           fi
 
+      - name: OIDC preflight (env policy + npm floor)
+        # Fails fast before publishing if the consumer-side prerequisites are
+        # missing. Covers two silent-failure shapes:
+        #   (a) Missing trust binding — caught later by npm itself (FM-A).
+        #   (b) Missing or under-protected GitHub Environment. The env claim
+        #       on the OIDC token comes from the GitHub Environment the job
+        #       runs under, and GitHub auto-creates a referenced env with
+        #       NO protection rules if it doesn't exist — so without a
+        #       main-only deployment_branch_policy, the env claim would be
+        #       mintable from any branch and consumed by any matching npm
+        #       trust binding.
+        # NOTE: this check requires ADOBE_BOT_GITHUB_TOKEN to have at least
+        # "admin:read" / "Administration: read" on the consumer repo to read
+        # `/environments` endpoints — `repo` scope alone is NOT enough on
+        # fine-grained PATs. See docs/npm-oidc-migration.md "Per-consumer
+        # server-side setup" for the permission requirement.
+        if: inputs.npm-oidc-enabled
+        env:
+          GH_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
+          ENV_NAME: ${{ inputs.vpc-enabled && 'prod' || 'npm-publish' }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "Checking OIDC env '$ENV_NAME' on $REPO..."
+
+          # Helper: run gh api, surface stderr on failure rather than masking
+          # transient API blips as policy errors. Returns body on success.
+          gh_api() {
+            local path=$1
+            local out rc
+            set +e
+            out=$(gh api "$path" 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+              echo "::error::gh api failed for '$path' (exit $rc). Token may lack 'Administration: read' on $REPO, or transient API issue. Output:"
+              echo "$out"
+              return $rc
+            fi
+            printf '%s' "$out"
+          }
+
+          # 1) Env must exist. A 404 here means either the consumer hasn't
+          #    created the env, or GitHub auto-created it without rules (in
+          #    which case the next checks fail — but the explicit existence
+          #    check gives a clearer error first).
+          ENV_BODY=$(gh_api "repos/${REPO}/environments/${ENV_NAME}") || {
+            echo "::error::Environment '${ENV_NAME}' does not exist on ${REPO} (or token lacks read perms). Create it (Settings → Environments) with a main-only deployment_branch_policy and can_admins_bypass=false. See docs/npm-oidc-migration.md."
+            exit 1
+          }
+
+          # 2) Admins must NOT be able to bypass the env policy. Without this,
+          #    an admin can approve a deployment from any branch, defeating
+          #    the main-only branch policy enforced below.
+          #
+          #    Polarity is inverted on purpose: only the literal string
+          #    "false" lets the preflight pass; ANY other value fails. This
+          #    keeps us fail-closed against three drift cases that would
+          #    otherwise silently green-light a misconfigured env:
+          #      - field missing            → jq emits "true"  → fails ✓
+          #      - field present but null   → jq emits "null"  → fails ✓
+          #      - future API shape change  → unexpected value → fails ✓
+          #
+          #    Cannot use `.can_admins_bypass // true` here — jq's `//`
+          #    alternative operator treats both `null` AND `false` as
+          #    "absent," so `false // true` returns `true` and would fire on
+          #    correctly-configured consumers. The `has()` form below
+          #    distinguishes "missing" from "present and false."
+          CAN_BYPASS=$(printf '%s' "$ENV_BODY" | jq -r 'if has("can_admins_bypass") then .can_admins_bypass else true end')
+          if [ "$CAN_BYPASS" != "false" ]; then
+            echo "::error::Environment '${ENV_NAME}' on ${REPO} has can_admins_bypass set to '${CAN_BYPASS}' (not the literal 'false'). An admin could approve a deployment from a non-main branch, defeating the main-only deployment_branch_policy. Set can_admins_bypass=false (Settings → Environments → ${ENV_NAME})."
+            exit 1
+          fi
+
+          # 3) Env must have a deployment_branch_policy of some kind.
+          POLICY=$(printf '%s' "$ENV_BODY" | jq -c '.deployment_branch_policy')
+          if [ "$POLICY" = "null" ] || [ -z "$POLICY" ]; then
+            echo "::error::Environment '${ENV_NAME}' on ${REPO} has no deployment_branch_policy. Without it, GitHub mints OIDC tokens with this env claim for any branch, which weakens the trust binding's runtime check. Add a custom-branch policy allowing only 'main'."
+            exit 1
+          fi
+
+          # 4) Either custom_branch_policies (with EXACTLY 'main') or
+          #    protected_branches mode is acceptable. Anything else fails.
+          PROTECTED=$(printf '%s' "$POLICY" | jq -r '.protected_branches')
+          CUSTOM=$(printf '%s' "$POLICY" | jq -r '.custom_branch_policies')
+          if [ "$CUSTOM" = "true" ]; then
+            # Exclusivity check: 'main' must be the ONLY allowed branch.
+            # Adding extra branches (e.g. 'release/*') subverts the
+            # main-only intent of the security model.
+            BRANCHES_RAW=$(gh_api "repos/${REPO}/environments/${ENV_NAME}/deployment-branch-policies") || exit 1
+            BRANCHES=$(printf '%s' "$BRANCHES_RAW" | jq -r '.branch_policies[].name' | sort -u)
+            BRANCH_COUNT=$(printf '%s\n' "$BRANCHES" | grep -c . || true)
+            if [ "$BRANCH_COUNT" -ne 1 ] || [ "$BRANCHES" != "main" ]; then
+              echo "::error::Environment '${ENV_NAME}' must allow ONLY 'main' as a deployment branch. Found ${BRANCH_COUNT} branch entries:"
+              printf '  - %s\n' $BRANCHES
+              echo "Remove all entries except 'main' (Settings → Environments → ${ENV_NAME} → Deployment branches)."
+              exit 1
+            fi
+            echo "OK: env '${ENV_NAME}' allows only 'main' (custom_branch_policies mode)."
+          elif [ "$PROTECTED" = "true" ]; then
+            echo "OK: env '${ENV_NAME}' uses protected_branches mode (publishes restricted to protected refs)."
+          else
+            echo "::error::Environment '${ENV_NAME}' has a deployment_branch_policy object but neither protected_branches nor custom_branch_policies is true. Tighten the policy so it accepts ONLY 'main' (Settings → Environments → ${ENV_NAME})."
+            exit 1
+          fi
+
+      - name: Update NPM (OIDC requires npm >= 11.5.1)
+        # Runs AFTER the setup-node-npm composite (which has already done
+        # `npm ci` with whatever npm shipped with .nvmrc's Node version).
+        # The OIDC code path is in @semantic-release/npm — it invokes
+        # `npm publish` from the global npm, which is what gets upgraded
+        # here. npm 11's publish path is backward-compatible with a
+        # node_modules tree installed by npm 10, so this ordering is safe
+        # without restructuring the composite.
+        # 11.13.0 is the latest patch satisfying the >=11.5.1 OIDC floor as
+        # of v3.0.0; bump intentionally when the floor moves. After the
+        # install, the version is asserted explicitly so a silently-failed
+        # upgrade (e.g. transient registry blip) cannot publish under an
+        # npm version without trusted-publishing support.
+        if: inputs.npm-oidc-enabled
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if npm install -g npm@11.13.0; then break; fi
+            echo "npm install attempt ${attempt} failed; retrying in 5s..."
+            sleep 5
+          done
+          ACTUAL=$(npm --version)
+          # Compare via `sort -V` (coreutils) without needing a semver helper.
+          if [ "$(printf '%s\n%s\n' "11.5.1" "$ACTUAL" | sort -V | head -n1)" != "11.5.1" ]; then
+            echo "::error::npm ${ACTUAL} does not satisfy OIDC floor 11.5.1; aborting before publish."
+            exit 1
+          fi
+          echo "npm ${ACTUAL} >= 11.5.1 ✓"
+
+      - name: Configure NPM_TOKEN (legacy mode only) — release
+        # Legacy mode only: inject the long-lived token into $GITHUB_ENV so the
+        # subsequent Semantic Release step inherits it. In OIDC mode this step
+        # is skipped, leaving NPM_TOKEN UNSET (the gated form preferred by the
+        # reviewer because it is correct under both readings of how npm treats
+        # an empty NPM_TOKEN). See the matching dry-run step above for the
+        # full rationale and the rejected-ternary history.
+        if: ${{ !inputs.npm-oidc-enabled }}
+        env:
+          ADOBE_BOT_NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+        run: |
+          # See the dry-run "Configure NPM_TOKEN" step for heredoc-delimiter
+          # and trailing-newline caveats; the pattern below is intentionally
+          # identical so the two stay in sync.
+          {
+            echo "NPM_TOKEN<<__MYSTICAT_CI_EOF__"
+            printf '%s' "${ADOBE_BOT_NPM_TOKEN%$'\n'}"
+            echo
+            echo "__MYSTICAT_CI_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Capture pre-publish registry version (for OIDC identity check)
+        # We need to detect whether Semantic Release actually published a new
+        # version in this run. If it did not (no fix:/feat:/breaking commits
+        # since last release), the registry's "latest" version was published
+        # by whatever tooling published it before — possibly adobe-admin via
+        # token, months ago. Asserting that "the latest publish was OIDC"
+        # would then false-positive on every no-op release. So we snapshot
+        # the registry version BEFORE running Semantic Release, then compare
+        # to AFTER in the verification step. Only if the version changed
+        # (meaning we just published) do we assert _npmUser.
+        #
+        # This step MUST run before Semantic Release. If it runs after, the
+        # "pre" capture reflects the version Semantic Release just published,
+        # POST == PRE in the verification step, and the identity check
+        # short-circuits as "no publish in this run" — silently bypassing
+        # the fail-loud control for the silent-token-fallback class of bugs.
+        if: inputs.npm-oidc-enabled
+        id: pre-publish
+        run: |
+          set -euo pipefail
+          if [ ! -f package.json ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=no-package-json" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PKG=$(jq -r '.name // empty' package.json)
+          if [ -z "$PKG" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=no-package-name" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `npm view <pkg> version` returns just the version string. If the
+          # package was never published, npm errors with E404; treat that as
+          # "no prior version" rather than failing the preflight.
+          PRE_VERSION=$(npm view "$PKG" version 2>/dev/null || echo "")
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "pre_version=$PRE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Captured pre-publish: $PKG@${PRE_VERSION:-<unpublished>}"
+
       - name: Semantic Release
         run: npm run semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.ADOBE_BOT_NPM_TOKEN }}
+          # NPM_TOKEN is inherited from $GITHUB_ENV when in legacy mode (see
+          # the preceding "Configure NPM_TOKEN" step). In OIDC mode it is
+          # deliberately absent — @semantic-release/npm performs OIDC token
+          # exchange via the configured GitHub Environment. NPM_CONFIG_PROVENANCE
+          # is still expressed inline because '' (its OIDC-disabled value) is
+          # functionally inert: npm reads it as "config not set."
+          NPM_CONFIG_PROVENANCE: ${{ inputs.npm-oidc-enabled && 'true' || '' }}
           AWS_REGION: us-east-1
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
           VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
+
+      - name: Verify OIDC publish identity
+        # Durable fail-loud control for the silent-token-fallback class of
+        # bugs. If anything causes a publish to happen via a token instead
+        # of OIDC, the just-published version's _npmUser will not be the
+        # GitHub Actions identity and this step fails the run.
+        #
+        # We compare the registry version pre- vs post-Semantic-Release. If
+        # unchanged, no publish happened — skip (otherwise we'd assert
+        # against a prior token-era publish and false-positive). If changed,
+        # query _npmUser for the NEW version specifically and assert.
+        #
+        # _npmUser (not dist.attestations) is the canary because provenance
+        # attestations can be present on token-authed publishes too — they
+        # sign via id-token independently of registry auth.
+        if: inputs.npm-oidc-enabled && success() && steps.pre-publish.outputs.skip != 'true'
+        env:
+          PKG: ${{ steps.pre-publish.outputs.pkg }}
+          PRE_VERSION: ${{ steps.pre-publish.outputs.pre_version }}
+        run: |
+          set -euo pipefail
+          # Allow up to 60s for the registry to settle the just-published version.
+          POST_VERSION=""
+          for attempt in 1 2 3 4 5 6; do
+            POST_VERSION=$(npm view "$PKG" version 2>/dev/null || echo "")
+            if [ -n "$POST_VERSION" ] && [ "$POST_VERSION" != "$PRE_VERSION" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$POST_VERSION" = "$PRE_VERSION" ]; then
+            echo "No publish in this run (registry version unchanged: ${PRE_VERSION:-<unpublished>}). Skipping OIDC publish identity check."
+            exit 0
+          fi
+
+          if [ -z "$POST_VERSION" ]; then
+            echo "::warning::Could not read registry version for $PKG after publish (registry hiccup?). Not failing the run."
+            exit 0
+          fi
+
+          # Query the NEW version's publisher specifically. Using --json
+          # gives a stable, parseable shape; jq normalizes both the string
+          # ("GitHub Actions <email>") and object ({name, email}) variants
+          # observed across npm versions.
+          USER_JSON=$(npm view "$PKG@$POST_VERSION" _npmUser --json 2>/dev/null || echo '""')
+          NPM_USER=$(printf '%s' "$USER_JSON" | jq -r '
+            if type == "string" then .
+            elif type == "object" then "\(.name // "")<\(.email // "")>"
+            else "" end
+          ')
+          case "$NPM_USER" in
+            *"GitHub Actions"*)
+              echo "OIDC publish identity verified: $PKG@$POST_VERSION _npmUser=$NPM_USER"
+              ;;
+            "")
+              echo "::warning::Could not read _npmUser for $PKG@$POST_VERSION (registry hiccup). Not failing the run."
+              ;;
+            *)
+              echo "::error::OIDC publish identity check FAILED: $PKG@$POST_VERSION was published as _npmUser='$NPM_USER', expected to contain 'GitHub Actions'. Token-based publishing may have occurred — check trust binding and re-register if needed (FM-A). See docs/npm-oidc-migration.md."
+              exit 1
+              ;;
+          esac
 
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
