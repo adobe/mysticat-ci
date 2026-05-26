@@ -1,0 +1,46 @@
+name: Semantic Release
+
+# Auto-publishes a GitHub Release on every push to main using conventional
+# commits to determine the semver bump (matches the pattern in spacecat-api-
+# service, spacecat-audit-worker, etc.). The existing release.yaml workflow
+# then fires on the published Release and moves the floating vN tag, so
+# consumers using @vN pick up the change on their next CI run.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: write
+
+concurrency:
+  group: semantic-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ github.actor != 'adobe-bot' && !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN || github.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Semantic Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN || github.token }}
+        run: npm run semantic-release
