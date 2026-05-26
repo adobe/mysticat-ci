@@ -39,8 +39,9 @@ When `npm-oidc-enabled: true`:
   `environment: npm-publish` (or `prod` if `vpc-enabled: true` — see
   environment selection below).
 - An OIDC preflight step asserts the GitHub Environment exists with a
-  main-only `deployment_branch_policy` before publish — failing fast if
-  the consumer-side env-protection setup is missing.
+  main-only `deployment_branch_policy` and `can_admins_bypass: false`
+  before publish — failing fast if the consumer-side env-protection
+  setup is missing or under-configured.
 - An "Update NPM" step installs `npm@11.13.0` to satisfy the OIDC floor
   (`npm >= 11.5.1`), with a retry loop and an explicit version assertion
   so a silently-failed upgrade cannot publish under an unsupported npm.

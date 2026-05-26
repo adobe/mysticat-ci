@@ -327,14 +327,37 @@ jobs:
             exit 1
           }
 
-          # 2) Env must have a deployment_branch_policy of some kind.
+          # 2) Admins must NOT be able to bypass the env policy. Without this,
+          #    an admin can approve a deployment from any branch, defeating
+          #    the main-only branch policy enforced below.
+          #
+          #    Polarity is inverted on purpose: only the literal string
+          #    "false" lets the preflight pass; ANY other value fails. This
+          #    keeps us fail-closed against three drift cases that would
+          #    otherwise silently green-light a misconfigured env:
+          #      - field missing            → jq emits "true"  → fails ✓
+          #      - field present but null   → jq emits "null"  → fails ✓
+          #      - future API shape change  → unexpected value → fails ✓
+          #
+          #    Cannot use `.can_admins_bypass // true` here — jq's `//`
+          #    alternative operator treats both `null` AND `false` as
+          #    "absent," so `false // true` returns `true` and would fire on
+          #    correctly-configured consumers. The `has()` form below
+          #    distinguishes "missing" from "present and false."
+          CAN_BYPASS=$(printf '%s' "$ENV_BODY" | jq -r 'if has("can_admins_bypass") then .can_admins_bypass else true end')
+          if [ "$CAN_BYPASS" != "false" ]; then
+            echo "::error::Environment '${ENV_NAME}' on ${REPO} has can_admins_bypass set to '${CAN_BYPASS}' (not the literal 'false'). An admin could approve a deployment from a non-main branch, defeating the main-only deployment_branch_policy. Set can_admins_bypass=false (Settings → Environments → ${ENV_NAME})."
+            exit 1
+          fi
+
+          # 3) Env must have a deployment_branch_policy of some kind.
           POLICY=$(printf '%s' "$ENV_BODY" | jq -c '.deployment_branch_policy')
           if [ "$POLICY" = "null" ] || [ -z "$POLICY" ]; then
             echo "::error::Environment '${ENV_NAME}' on ${REPO} has no deployment_branch_policy. Without it, GitHub mints OIDC tokens with this env claim for any branch, which weakens the trust binding's runtime check. Add a custom-branch policy allowing only 'main'."
             exit 1
           fi
 
-          # 3) Either custom_branch_policies (with EXACTLY 'main') or
+          # 4) Either custom_branch_policies (with EXACTLY 'main') or
           #    protected_branches mode is acceptable. Anything else fails.
           PROTECTED=$(printf '%s' "$POLICY" | jq -r '.protected_branches')
           CUSTOM=$(printf '%s' "$POLICY" | jq -r '.custom_branch_policies')
@@ -409,23 +432,6 @@ jobs:
             echo "__MYSTICAT_CI_EOF__"
           } >> "$GITHUB_ENV"
 
-      - name: Semantic Release
-        run: npm run semantic-release
-        env:
-          GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
-          # NPM_TOKEN is inherited from $GITHUB_ENV when in legacy mode (see
-          # the preceding "Configure NPM_TOKEN" step). In OIDC mode it is
-          # deliberately absent — @semantic-release/npm performs OIDC token
-          # exchange via the configured GitHub Environment. NPM_CONFIG_PROVENANCE
-          # is still expressed inline because '' (its OIDC-disabled value) is
-          # functionally inert: npm reads it as "config not set."
-          NPM_CONFIG_PROVENANCE: ${{ inputs.npm-oidc-enabled && 'true' || '' }}
-          AWS_REGION: us-east-1
-          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
-          VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
-          VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
-          VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
-
       - name: Capture pre-publish registry version (for OIDC identity check)
         # We need to detect whether Semantic Release actually published a new
         # version in this run. If it did not (no fix:/feat:/breaking commits
@@ -436,6 +442,12 @@ jobs:
         # the registry version BEFORE running Semantic Release, then compare
         # to AFTER in the verification step. Only if the version changed
         # (meaning we just published) do we assert _npmUser.
+        #
+        # This step MUST run before Semantic Release. If it runs after, the
+        # "pre" capture reflects the version Semantic Release just published,
+        # POST == PRE in the verification step, and the identity check
+        # short-circuits as "no publish in this run" — silently bypassing
+        # the fail-loud control for the silent-token-fallback class of bugs.
         if: inputs.npm-oidc-enabled
         id: pre-publish
         run: |
@@ -458,6 +470,23 @@ jobs:
           echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
           echo "pre_version=$PRE_VERSION" >> "$GITHUB_OUTPUT"
           echo "Captured pre-publish: $PKG@${PRE_VERSION:-<unpublished>}"
+
+      - name: Semantic Release
+        run: npm run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.ADOBE_BOT_GITHUB_TOKEN }}
+          # NPM_TOKEN is inherited from $GITHUB_ENV when in legacy mode (see
+          # the preceding "Configure NPM_TOKEN" step). In OIDC mode it is
+          # deliberately absent — @semantic-release/npm performs OIDC token
+          # exchange via the configured GitHub Environment. NPM_CONFIG_PROVENANCE
+          # is still expressed inline because '' (its OIDC-disabled value) is
+          # functionally inert: npm reads it as "config not set."
+          NPM_CONFIG_PROVENANCE: ${{ inputs.npm-oidc-enabled && 'true' || '' }}
+          AWS_REGION: us-east-1
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+          VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
+          VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
+          VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
 
       - name: Verify OIDC publish identity
         # Durable fail-loud control for the silent-token-fallback class of
