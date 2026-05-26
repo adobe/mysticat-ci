@@ -139,6 +139,12 @@ jobs:
         # static asset / `readFileSync(import.meta.url)` dropped by the
         # bundler). See docs/bundle-build-gate.md.
         if: inputs.bundle-build
+        # Step-level timeout bounds the hang vector introduced by hedy's
+        # synthetic invocation. If bundled code attempts a network call at
+        # module load (precisely the class of bug this gate catches), it can
+        # stall on DNS or connection timeout — without this, a hung build
+        # would occupy a runner until GitHub's default 360-minute job timeout.
+        timeout-minutes: 10
         env:
           # hedy substitutes these into hlx.* fields at build time. They are
           # deploy-time concerns only — dummy values keep the build hermetic

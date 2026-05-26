@@ -82,7 +82,9 @@ env:
 
 This matches the pattern proved out in `spacecat-api-service` PR #2466. It works on PRs that don't have access to environment-scoped secrets (forks, dependabot, contributors without `prod` env access).
 
-If a future service needs additional build-time env vars baked into `hlx`, that is the trigger to add another dummy here — but a build-time secret that genuinely cannot be dummied indicates a deeper problem (build steps should not need prod credentials), so the right answer there is usually to refactor the build, not to plumb a secret.
+If a future service needs additional build-time env vars baked into `hlx`, the fix lives **in this repo, not in the consuming service**. Open a PR against `mysticat-ci` that adds the new dummy to the `env:` block on this step — the change ships in the next `v2.x` release and every consumer picks it up via the floating `v2` tag. Putting the dummy in the consumer's CI yaml would not help: the bundle step runs inside the reusable workflow, where the consumer's env block isn't visible.
+
+A build-time secret that genuinely cannot be dummied indicates a deeper problem (build steps should not need prod credentials), so the right answer there is usually to refactor the build, not to plumb a secret.
 
 ## Rollout
 
