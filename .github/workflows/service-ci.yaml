@@ -29,6 +29,18 @@ on:
         description: "Run PostgreSQL (v3) integration tests after build (requires ECR access)"
         default: false
         type: boolean
+      bundle-build:
+        description: >
+          Opt in to a Lambda bundle smoke check via `npm run build`
+          (= helix-deploy `--test-bundle`). Bundles the Lambda artifact and
+          invokes it against a synthetic healthcheck event — exits non-zero on
+          any non-2xx response. Catches module-load failures that source-based
+          unit tests miss (missing static assets,
+          `readFileSync(import.meta.url)` bundle drops, top-level FS/network
+          access). See docs/bundle-build-gate.md. Services that bundle with
+          anything other than helix-deploy (e.g. tsup) should leave this off.
+        default: false
+        type: boolean
       vpc-enabled:
         description: >
           Opt in to declarative VPC attachment. When true, deploy jobs run under
@@ -118,6 +130,25 @@ jobs:
       - name: Docs Build
         if: inputs.docs-lint
         run: npm run docs:build
+
+      - name: Build Lambda bundle (smoke check)
+        # `npm run build` -> `hedy -v --test-bundle`: bundles + zips + invokes
+        # the bundled `lambda()` against a synthetic healthcheck event. Catches
+        # the class of failure where source-based unit tests pass but the
+        # bundled artifact crashes at cold start (e.g. SITES-45260 — missing
+        # static asset / `readFileSync(import.meta.url)` dropped by the
+        # bundler). See docs/bundle-build-gate.md.
+        if: inputs.bundle-build
+        env:
+          # hedy substitutes these into hlx.* fields at build time. They are
+          # deploy-time concerns only — dummy values keep the build hermetic
+          # so the gate runs on PRs that don't have access to environment-
+          # scoped secrets (forks, dependabot, contributors without prod env).
+          VPC_SUBNET_1: subnet-00000000000000000
+          VPC_SUBNET_2: subnet-00000000000000000
+          VPC_SG_ID: sg-00000000000000000
+          AWS_ACCOUNT_ID: '000000000000'
+        run: npm run build
 
       - name: Semantic Release (Dry Run)
         if: github.event_name == 'push' && github.ref != 'refs/heads/main'
