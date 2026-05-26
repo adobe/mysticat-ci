@@ -1,16 +1,24 @@
 name: Auto Release
 
-# Publishes a GitHub Release on every meaningful merge to main, which fires
-# release.yaml to move the floating major-version tag (v1, v2, …) — so
-# consumers using @vN see the change on their next CI run with no manual
-# step.
+# Publishes a GitHub Release on every meaningful merge to main. The existing
+# release.yaml then fires on the published Release and moves the floating
+# major-version tag (v1, v2, …) — so consumers using @vN see the change on
+# their next CI run with no manual step.
 #
-# Version bump rules (from the merge commit's conventional-commit subject):
-#   *!: / *!(scope): / "BREAKING CHANGE" in body  -> major
-#   feat: / feat(scope):                          -> minor
-#   anything else                                  -> patch
+# Version bump rules (read from the merged PR title, not the merge commit
+# subject — see "Bump source" below):
+#   *!: / *!(scope):  ->  major
+#   feat: / feat(scope):  ->  minor
+#   anything else  ->  patch
 #
-# Suppress a release by adding [skip release] to the commit message.
+# Bump source: when a PR is merged with a merge-commit (this repo's default),
+# the head_commit.message subject is "Merge pull request #N from …", which
+# never matches a conventional-commit prefix. The job therefore extracts the
+# PR number from the merge subject and reads the PR's actual title via
+# `gh pr view`. For squash/direct commits (no PR # in the subject), it falls
+# back to the head commit subject.
+#
+# Suppress a release by adding [skip release] to the merge commit message.
 
 on:
   push:
@@ -22,6 +30,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
 
 concurrency:
   group: auto-release-main
@@ -40,26 +49,62 @@ jobs:
 
       - name: Compute next tag
         id: t
+        env:
+          # Route untrusted webhook data through env so it is treated as a
+          # plain string, never interpolated into the shell. Inline
+          # `${{ ... }}` expansion is what enables ; rm -rf / and $() payloads
+          # in commit messages — this is the same pattern the repo already
+          # adopted for branch names in service-ci.yaml.
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+
+          # Re-fetch tags so a release published seconds earlier by a
+          # racing run is visible to this run's "latest tag" lookup.
+          git fetch --force --tags origin >/dev/null 2>&1
+
+          # Find latest semver (strict vN.N.N — exclude floating vN and any
+          # future prerelease shape like v2.1.5-rc1).
+          LATEST=$(git tag -l --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | head -1)
           if [ -z "$LATEST" ]; then
             echo "ERROR: no existing vN.N.N tag found"
             exit 1
           fi
           MAJOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\..*/\1/')
           MINOR=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.([0-9]+)\..*/\1/')
-          PATCH=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+).*/\1/')
+          PATCH=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/')
 
-          MSG="${{ github.event.head_commit.message }}"
-          SUBJECT=$(printf '%s\n' "$MSG" | head -1)
-
-          if printf '%s' "$MSG" | grep -qE '^[a-z]+(\([^)]+\))?!:|BREAKING CHANGE'; then
-            NEXT="v$((MAJOR+1)).0.0"; BUMP=major
-          elif printf '%s' "$SUBJECT" | grep -qE '^feat(\([^)]+\))?:'; then
-            NEXT="v$MAJOR.$((MINOR+1)).0"; BUMP=minor
+          # Resolve the bump source. If the head commit is a GitHub merge
+          # commit, its subject contains "Merge pull request #N from …" —
+          # fetch that PR's title. Otherwise (squash, rebase, direct push)
+          # use the commit subject itself.
+          SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MSG" | head -1)
+          PR_NUM=$(printf '%s' "$SUBJECT" \
+            | grep -oE 'Merge pull request #[0-9]+' \
+            | grep -oE '[0-9]+' \
+            || true)
+          if [ -n "$PR_NUM" ]; then
+            BUMP_SUBJECT=$(gh pr view "$PR_NUM" --repo "$REPO" --json title --jq .title)
+            echo "Bump source: PR #$PR_NUM title -> $BUMP_SUBJECT"
           else
-            NEXT="v$MAJOR.$MINOR.$((PATCH+1))"; BUMP=patch
+            BUMP_SUBJECT="$SUBJECT"
+            echo "Bump source: head commit subject -> $BUMP_SUBJECT"
+          fi
+
+          # Bump rules. Match against the resolved subject only.
+          if printf '%s' "$BUMP_SUBJECT" | grep -qE '^[a-zA-Z]+(\([^)]+\))?!:'; then
+            NEXT="v$((MAJOR+1)).0.0"
+            BUMP=major
+          elif printf '%s' "$BUMP_SUBJECT" | grep -qE '^feat(\([^)]+\))?:'; then
+            NEXT="v$MAJOR.$((MINOR+1)).0"
+            BUMP=minor
+          else
+            NEXT="v$MAJOR.$MINOR.$((PATCH+1))"
+            BUMP=patch
           fi
 
           echo "tag=$NEXT"   >> "$GITHUB_OUTPUT"
@@ -69,9 +114,22 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          NEXT_TAG: ${{ steps.t.outputs.tag }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
-          gh release create "${{ steps.t.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
-            --title  "${{ steps.t.outputs.tag }}" \
+          set -euo pipefail
+
+          # Idempotency guard: if a Release for this tag already exists
+          # (e.g. created by a racing run that finished a moment earlier),
+          # skip cleanly instead of failing the job.
+          if gh release view "$NEXT_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $NEXT_TAG already exists — skipping."
+            exit 0
+          fi
+
+          gh release create "$NEXT_TAG" \
+            --repo "$REPO" \
+            --target "$TARGET_SHA" \
+            --title  "$NEXT_TAG" \
             --generate-notes
