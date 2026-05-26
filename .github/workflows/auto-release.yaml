@@ -1,0 +1,77 @@
+name: Auto Release
+
+# Publishes a GitHub Release on every meaningful merge to main, which fires
+# release.yaml to move the floating major-version tag (v1, v2, …) — so
+# consumers using @vN see the change on their next CI run with no manual
+# step.
+#
+# Version bump rules (from the merge commit's conventional-commit subject):
+#   *!: / *!(scope): / "BREAKING CHANGE" in body  -> major
+#   feat: / feat(scope):                          -> minor
+#   anything else                                  -> patch
+#
+# Suppress a release by adding [skip release] to the commit message.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compute next tag
+        id: t
+        run: |
+          set -euo pipefail
+          LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          if [ -z "$LATEST" ]; then
+            echo "ERROR: no existing vN.N.N tag found"
+            exit 1
+          fi
+          MAJOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\..*/\1/')
+          MINOR=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.([0-9]+)\..*/\1/')
+          PATCH=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+).*/\1/')
+
+          MSG="${{ github.event.head_commit.message }}"
+          SUBJECT=$(printf '%s\n' "$MSG" | head -1)
+
+          if printf '%s' "$MSG" | grep -qE '^[a-z]+(\([^)]+\))?!:|BREAKING CHANGE'; then
+            NEXT="v$((MAJOR+1)).0.0"; BUMP=major
+          elif printf '%s' "$SUBJECT" | grep -qE '^feat(\([^)]+\))?:'; then
+            NEXT="v$MAJOR.$((MINOR+1)).0"; BUMP=minor
+          else
+            NEXT="v$MAJOR.$MINOR.$((PATCH+1))"; BUMP=patch
+          fi
+
+          echo "tag=$NEXT"   >> "$GITHUB_OUTPUT"
+          echo "bump=$BUMP"  >> "$GITHUB_OUTPUT"
+          echo "Computed: $LATEST -> $NEXT ($BUMP)"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.t.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title  "${{ steps.t.outputs.tag }}" \
+            --generate-notes
