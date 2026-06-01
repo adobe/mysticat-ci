@@ -267,6 +267,15 @@ jobs:
             # Release exists; tag MUST also exist. Retry the tag-SHA read.
             TAG_SHA=$(retry gh api "/repos/$REPO/git/ref/tags/$NEXT_TAG" \
               --jq .object.sha 2>/dev/null || echo "")
+            # Empty TAG_SHA means the read failed transiently (the release was
+            # just confirmed to exist on line 266, so the tag must too). Fail
+            # loud as a transient error — do NOT fall through to the equality
+            # check, which would emit a misleading "Drift detected" pointing the
+            # operator at a phantom consistency problem instead of a re-run.
+            if [ -z "$TAG_SHA" ]; then
+              echo "::error::Failed to read tag SHA for $NEXT_TAG after 3 attempts (transient API failure). Re-run should resolve."
+              exit 1
+            fi
             if [ "$TAG_SHA" = "$TARGET_SHA" ]; then
               echo "Release $NEXT_TAG already exists at $TARGET_SHA — skipping create."
             else
