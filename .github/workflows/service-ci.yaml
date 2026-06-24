@@ -316,8 +316,11 @@ jobs:
               exit 1
             fi
             echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
-            [ "$MAC_GIVER_ACTIVE" = "true" ] && echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && [ "$MAC_GIVER_ACTIVE" != "true" ] && echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
+              echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
               echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
@@ -443,8 +446,11 @@ jobs:
               exit 1
             fi
             echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
-            [ "$MAC_GIVER_ACTIVE" = "true" ] && echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && [ "$MAC_GIVER_ACTIVE" != "true" ] && echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
+              echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
               echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
@@ -596,8 +602,11 @@ jobs:
               exit 1
             fi
             echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
-            [ "$MAC_GIVER_ACTIVE" = "true" ] && echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && [ "$MAC_GIVER_ACTIVE" != "true" ] && echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
+              echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
               echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
