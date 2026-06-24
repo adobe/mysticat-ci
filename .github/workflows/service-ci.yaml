@@ -347,6 +347,20 @@ jobs:
             fi
           fi
 
+      - name: Strip mac-giver-caller placeholder from package.json (when skipped in this env)
+        if: inputs.mac-giver-caller && env.MAC_GIVER_ACTIVE != 'true'
+        run: |
+          # When mac-giver-caller is enabled for the workflow but disabled for
+          # this specific GitHub Environment via mac-giver-caller-environments,
+          # the MAC_GIVER_CALLER_SG_ID export is empty. hedy then sees
+          # ["sg-real", ""] in hlx.awsVpcSecurityGroupIds and refuses to deploy
+          # with "aws-vpc-security-group-ids contains an empty string".
+          # Strip the literal placeholder so hedy sees a clean single-SG array.
+          jq '(.hlx.awsVpcSecurityGroupIds) |= map(select(. != "${env.MAC_GIVER_CALLER_SG_ID}"))' \
+            package.json > package.json.tmp && mv package.json.tmp package.json
+          echo "Dropped \${env.MAC_GIVER_CALLER_SG_ID} from package.json hlx.awsVpcSecurityGroupIds"
+          jq '.hlx.awsVpcSecurityGroupIds' package.json
+
       - name: Semantic Release
         run: npm run semantic-release
         env:
@@ -491,6 +505,15 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Strip mac-giver-caller placeholder from package.json (when skipped in this env)
+        if: inputs.mac-giver-caller && env.MAC_GIVER_ACTIVE != 'true'
+        run: |
+          # See semantic-release job for rationale. Same fix.
+          jq '(.hlx.awsVpcSecurityGroupIds) |= map(select(. != "${env.MAC_GIVER_CALLER_SG_ID}"))' \
+            package.json > package.json.tmp && mv package.json.tmp package.json
+          echo "Dropped \${env.MAC_GIVER_CALLER_SG_ID} from package.json hlx.awsVpcSecurityGroupIds"
+          jq '.hlx.awsVpcSecurityGroupIds' package.json
 
       - name: Deploy to Stage
         run: npm run deploy-stage
@@ -662,6 +685,15 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Strip mac-giver-caller placeholder from package.json (when skipped in this env)
+        if: steps.main-check.outputs.skip_deploy != 'true' && inputs.mac-giver-caller && env.MAC_GIVER_ACTIVE != 'true'
+        run: |
+          # See semantic-release job for rationale. Same fix.
+          jq '(.hlx.awsVpcSecurityGroupIds) |= map(select(. != "${env.MAC_GIVER_CALLER_SG_ID}"))' \
+            package.json > package.json.tmp && mv package.json.tmp package.json
+          echo "Dropped \${env.MAC_GIVER_CALLER_SG_ID} from package.json hlx.awsVpcSecurityGroupIds"
+          jq '.hlx.awsVpcSecurityGroupIds' package.json
 
       - name: Branch Deployment
         id: deploy

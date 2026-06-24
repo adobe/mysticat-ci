@@ -91,7 +91,7 @@ jobs:
 
 Environments not in the list:
 - skip the `MAC_GIVER_CALLER_SG_ID` secret-required check
-- export `MAC_GIVER_CALLER_SG_ID=""` to helix-deploy (the caller SG is NOT attached)
+- jq-strip the `${env.MAC_GIVER_CALLER_SG_ID}` placeholder from `package.json` `hlx.awsVpcSecurityGroupIds` before helix-deploy runs (helix-deploy refuses to deploy when the post-substitution SG array contains an empty string)
 - skip the post-deploy "is the caller SG attached?" assertion
 
 Add an environment to the list (and populate its secret) when you're ready to roll mac-giver forward to it.
