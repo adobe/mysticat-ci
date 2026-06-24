@@ -62,6 +62,18 @@ on:
           call mac-giver (the IMS auth Lambdas).
         default: false
         type: boolean
+      mac-giver-caller-environments:
+        description: >
+          Comma-separated allowlist of GitHub Environments where mac-giver-caller
+          is active (e.g. "dev-branches" or "dev-branches,stage"). Default empty
+          means active in all three (dev-branches, stage, prod). Use this to roll
+          mac-giver out per-environment while the MAC_GIVER_CALLER_SG_ID secret
+          is staged across environments. Has no effect when mac-giver-caller is
+          false. Environments not in the list behave as if mac-giver-caller=false
+          for that job: the deploy still runs but the caller SG is not attached
+          and the post-deploy SG assertion is skipped.
+        default: ""
+        type: string
       lambda-function-name:
         description: >
           Optional override for the Lambda function name used by the post-deploy
@@ -257,12 +269,14 @@ jobs:
 
       - name: VPC config sanity check
         env:
+          THIS_ENV: prod
           VPC_ENABLED: ${{ inputs.vpc-enabled }}
           VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
           MAC_GIVER_CALLER_ENABLED: ${{ inputs.mac-giver-caller }}
           MAC_GIVER_CALLER_SG_ID: ${{ secrets.MAC_GIVER_CALLER_SG_ID }}
+          MAC_GIVER_CALLER_ENVIRONMENTS: ${{ inputs.mac-giver-caller-environments }}
         run: |
           set -euo pipefail
           HAS_VPC_HLX=0
@@ -271,14 +285,45 @@ jobs:
              && jq -e '.hlx.awsVpcSecurityGroupIds | arrays | length > 0' package.json >/dev/null 2>&1; then
             HAS_VPC_HLX=1
           fi
+
+          # Effective mac-giver activation for this GitHub Environment.
+          # Default (empty allowlist): active wherever mac-giver-caller=true.
+          # When mac-giver-caller-environments is set, restrict to listed envs.
+          MAC_GIVER_ACTIVE=false
+          if [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+            if [ -z "$MAC_GIVER_CALLER_ENVIRONMENTS" ]; then
+              MAC_GIVER_ACTIVE=true
+            else
+              # Strip whitespace so natural CSV formatting ("dev-branches, stage")
+              # matches reliably. GitHub Environment names contain no spaces.
+              NORMALIZED_ENVS="${MAC_GIVER_CALLER_ENVIRONMENTS//[[:space:]]/}"
+              # Validate each entry against the known set so typos like "Stage"
+              # or "dev-branch" fail loud instead of becoming a silent no-op.
+              IFS=',' read -ra _ALLOWED <<< "$NORMALIZED_ENVS"
+              for _e in "${_ALLOWED[@]}"; do
+                case "$_e" in
+                  dev-branches|stage|prod|"") ;;
+                  *)
+                    echo "::error::mac-giver-caller-environments contains unknown env '${_e}'. Valid values: dev-branches, stage, prod"
+                    exit 1
+                    ;;
+                esac
+              done
+              case ",${NORMALIZED_ENVS}," in
+                *",${THIS_ENV},"*) MAC_GIVER_ACTIVE=true ;;
+              esac
+            fi
+          fi
+          echo "MAC_GIVER_ACTIVE=$MAC_GIVER_ACTIVE" >> "$GITHUB_ENV"
+
           if [ "$VPC_ENABLED" = "true" ]; then
             MISSING=()
             [ -z "$VPC_SUBNET_1" ] && MISSING+=("VPC_SUBNET_1")
             [ -z "$VPC_SUBNET_2" ] && MISSING+=("VPC_SUBNET_2")
             [ -z "$VPC_SG_ID" ]    && MISSING+=("VPC_SG_ID")
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && [ -z "$MAC_GIVER_CALLER_SG_ID" ] && MISSING+=("MAC_GIVER_CALLER_SG_ID")
+            [ "$MAC_GIVER_ACTIVE" = "true" ] && [ -z "$MAC_GIVER_CALLER_SG_ID" ] && MISSING+=("MAC_GIVER_CALLER_SG_ID")
             if [ ${#MISSING[@]} -gt 0 ]; then
-              echo "::error::vpc-enabled=true but missing in the 'prod' environment: ${MISSING[*]}"
+              echo "::error::vpc-enabled=true but missing in the '${THIS_ENV}' environment: ${MISSING[*]}"
               exit 1
             fi
             if [ "$HAS_VPC_HLX" = "0" ]; then
@@ -286,7 +331,11 @@ jobs:
               exit 1
             fi
             echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
+              echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
               echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
@@ -308,7 +357,7 @@ jobs:
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
           VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
-          MAC_GIVER_CALLER_SG_ID: ${{ inputs.mac-giver-caller && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
+          MAC_GIVER_CALLER_SG_ID: ${{ env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
 
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
@@ -319,7 +368,7 @@ jobs:
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
           EXPECTED_MAC_GIVER_CALLER_SG: ${{ secrets.MAC_GIVER_CALLER_SG_ID }}
-          CHECK_MAC_GIVER_CALLER: ${{ inputs.mac-giver-caller }}
+          CHECK_MAC_GIVER_CALLER: ${{ env.MAC_GIVER_ACTIVE }}
         run: |
           set -euo pipefail
           echo "Waiting for Lambda $FUNC to finish updating..."
@@ -365,12 +414,14 @@ jobs:
 
       - name: VPC config sanity check
         env:
+          THIS_ENV: stage
           VPC_ENABLED: ${{ inputs.vpc-enabled }}
           VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
           MAC_GIVER_CALLER_ENABLED: ${{ inputs.mac-giver-caller }}
           MAC_GIVER_CALLER_SG_ID: ${{ secrets.MAC_GIVER_CALLER_SG_ID }}
+          MAC_GIVER_CALLER_ENVIRONMENTS: ${{ inputs.mac-giver-caller-environments }}
         run: |
           set -euo pipefail
           HAS_VPC_HLX=0
@@ -379,14 +430,45 @@ jobs:
              && jq -e '.hlx.awsVpcSecurityGroupIds | arrays | length > 0' package.json >/dev/null 2>&1; then
             HAS_VPC_HLX=1
           fi
+
+          # Effective mac-giver activation for this GitHub Environment.
+          # Default (empty allowlist): active wherever mac-giver-caller=true.
+          # When mac-giver-caller-environments is set, restrict to listed envs.
+          MAC_GIVER_ACTIVE=false
+          if [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+            if [ -z "$MAC_GIVER_CALLER_ENVIRONMENTS" ]; then
+              MAC_GIVER_ACTIVE=true
+            else
+              # Strip whitespace so natural CSV formatting ("dev-branches, stage")
+              # matches reliably. GitHub Environment names contain no spaces.
+              NORMALIZED_ENVS="${MAC_GIVER_CALLER_ENVIRONMENTS//[[:space:]]/}"
+              # Validate each entry against the known set so typos like "Stage"
+              # or "dev-branch" fail loud instead of becoming a silent no-op.
+              IFS=',' read -ra _ALLOWED <<< "$NORMALIZED_ENVS"
+              for _e in "${_ALLOWED[@]}"; do
+                case "$_e" in
+                  dev-branches|stage|prod|"") ;;
+                  *)
+                    echo "::error::mac-giver-caller-environments contains unknown env '${_e}'. Valid values: dev-branches, stage, prod"
+                    exit 1
+                    ;;
+                esac
+              done
+              case ",${NORMALIZED_ENVS}," in
+                *",${THIS_ENV},"*) MAC_GIVER_ACTIVE=true ;;
+              esac
+            fi
+          fi
+          echo "MAC_GIVER_ACTIVE=$MAC_GIVER_ACTIVE" >> "$GITHUB_ENV"
+
           if [ "$VPC_ENABLED" = "true" ]; then
             MISSING=()
             [ -z "$VPC_SUBNET_1" ] && MISSING+=("VPC_SUBNET_1")
             [ -z "$VPC_SUBNET_2" ] && MISSING+=("VPC_SUBNET_2")
             [ -z "$VPC_SG_ID" ]    && MISSING+=("VPC_SG_ID")
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && [ -z "$MAC_GIVER_CALLER_SG_ID" ] && MISSING+=("MAC_GIVER_CALLER_SG_ID")
+            [ "$MAC_GIVER_ACTIVE" = "true" ] && [ -z "$MAC_GIVER_CALLER_SG_ID" ] && MISSING+=("MAC_GIVER_CALLER_SG_ID")
             if [ ${#MISSING[@]} -gt 0 ]; then
-              echo "::error::vpc-enabled=true but missing in the 'stage' environment: ${MISSING[*]}"
+              echo "::error::vpc-enabled=true but missing in the '${THIS_ENV}' environment: ${MISSING[*]}"
               exit 1
             fi
             if [ "$HAS_VPC_HLX" = "0" ]; then
@@ -394,7 +476,11 @@ jobs:
               exit 1
             fi
             echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
+              echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
               echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
@@ -414,7 +500,7 @@ jobs:
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
           VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
-          MAC_GIVER_CALLER_SG_ID: ${{ inputs.mac-giver-caller && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
+          MAC_GIVER_CALLER_SG_ID: ${{ env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
 
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
@@ -425,7 +511,7 @@ jobs:
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
           EXPECTED_MAC_GIVER_CALLER_SG: ${{ secrets.MAC_GIVER_CALLER_SG_ID }}
-          CHECK_MAC_GIVER_CALLER: ${{ inputs.mac-giver-caller }}
+          CHECK_MAC_GIVER_CALLER: ${{ env.MAC_GIVER_ACTIVE }}
         run: |
           set -euo pipefail
           echo "Waiting for Lambda $FUNC to finish updating..."
@@ -499,12 +585,14 @@ jobs:
       - name: VPC config sanity check
         if: steps.main-check.outputs.skip_deploy != 'true'
         env:
+          THIS_ENV: dev-branches
           VPC_ENABLED: ${{ inputs.vpc-enabled }}
           VPC_SUBNET_1: ${{ secrets.VPC_SUBNET_1 }}
           VPC_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           VPC_SG_ID: ${{ secrets.VPC_SG_ID }}
           MAC_GIVER_CALLER_ENABLED: ${{ inputs.mac-giver-caller }}
           MAC_GIVER_CALLER_SG_ID: ${{ secrets.MAC_GIVER_CALLER_SG_ID }}
+          MAC_GIVER_CALLER_ENVIRONMENTS: ${{ inputs.mac-giver-caller-environments }}
         run: |
           set -euo pipefail
           HAS_VPC_HLX=0
@@ -513,14 +601,45 @@ jobs:
              && jq -e '.hlx.awsVpcSecurityGroupIds | arrays | length > 0' package.json >/dev/null 2>&1; then
             HAS_VPC_HLX=1
           fi
+
+          # Effective mac-giver activation for this GitHub Environment.
+          # Default (empty allowlist): active wherever mac-giver-caller=true.
+          # When mac-giver-caller-environments is set, restrict to listed envs.
+          MAC_GIVER_ACTIVE=false
+          if [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+            if [ -z "$MAC_GIVER_CALLER_ENVIRONMENTS" ]; then
+              MAC_GIVER_ACTIVE=true
+            else
+              # Strip whitespace so natural CSV formatting ("dev-branches, stage")
+              # matches reliably. GitHub Environment names contain no spaces.
+              NORMALIZED_ENVS="${MAC_GIVER_CALLER_ENVIRONMENTS//[[:space:]]/}"
+              # Validate each entry against the known set so typos like "Stage"
+              # or "dev-branch" fail loud instead of becoming a silent no-op.
+              IFS=',' read -ra _ALLOWED <<< "$NORMALIZED_ENVS"
+              for _e in "${_ALLOWED[@]}"; do
+                case "$_e" in
+                  dev-branches|stage|prod|"") ;;
+                  *)
+                    echo "::error::mac-giver-caller-environments contains unknown env '${_e}'. Valid values: dev-branches, stage, prod"
+                    exit 1
+                    ;;
+                esac
+              done
+              case ",${NORMALIZED_ENVS}," in
+                *",${THIS_ENV},"*) MAC_GIVER_ACTIVE=true ;;
+              esac
+            fi
+          fi
+          echo "MAC_GIVER_ACTIVE=$MAC_GIVER_ACTIVE" >> "$GITHUB_ENV"
+
           if [ "$VPC_ENABLED" = "true" ]; then
             MISSING=()
             [ -z "$VPC_SUBNET_1" ] && MISSING+=("VPC_SUBNET_1")
             [ -z "$VPC_SUBNET_2" ] && MISSING+=("VPC_SUBNET_2")
             [ -z "$VPC_SG_ID" ]    && MISSING+=("VPC_SG_ID")
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && [ -z "$MAC_GIVER_CALLER_SG_ID" ] && MISSING+=("MAC_GIVER_CALLER_SG_ID")
+            [ "$MAC_GIVER_ACTIVE" = "true" ] && [ -z "$MAC_GIVER_CALLER_SG_ID" ] && MISSING+=("MAC_GIVER_CALLER_SG_ID")
             if [ ${#MISSING[@]} -gt 0 ]; then
-              echo "::error::vpc-enabled=true but missing in the 'dev-branches' environment: ${MISSING[*]}"
+              echo "::error::vpc-enabled=true but missing in the '${THIS_ENV}' environment: ${MISSING[*]}"
               exit 1
             fi
             if [ "$HAS_VPC_HLX" = "0" ]; then
@@ -528,7 +647,11 @@ jobs:
               exit 1
             fi
             echo "Applying VPC config: SUBNETS=[$VPC_SUBNET_1,$VPC_SUBNET_2] SG=$VPC_SG_ID"
-            [ "$MAC_GIVER_CALLER_ENABLED" = "true" ] && echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
+              echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
+            elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+            fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
               echo "::error::package.json hlx references awsVpcSubnetIds/awsVpcSecurityGroupIds but vpc-enabled is false. Without opt-in, deploy would silently detach VPC. Set vpc-enabled: true or remove the hlx VPC fields."
@@ -550,7 +673,7 @@ jobs:
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
           VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
-          MAC_GIVER_CALLER_SG_ID: ${{ inputs.mac-giver-caller && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
+          MAC_GIVER_CALLER_SG_ID: ${{ env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
 
       - name: Verify Lambda VPC attachment
         if: steps.main-check.outputs.skip_deploy != 'true' && inputs.vpc-enabled
@@ -561,7 +684,7 @@ jobs:
           EXPECTED_SUBNET_2: ${{ secrets.VPC_SUBNET_2 }}
           EXPECTED_SG: ${{ secrets.VPC_SG_ID }}
           EXPECTED_MAC_GIVER_CALLER_SG: ${{ secrets.MAC_GIVER_CALLER_SG_ID }}
-          CHECK_MAC_GIVER_CALLER: ${{ inputs.mac-giver-caller }}
+          CHECK_MAC_GIVER_CALLER: ${{ env.MAC_GIVER_ACTIVE }}
         run: |
           set -euo pipefail
           echo "Waiting for Lambda $FUNC to finish updating..."
