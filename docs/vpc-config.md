@@ -51,7 +51,7 @@ jobs:
 
 Optional input: `lambda-function-name` overrides the default function-name convention (`spacecat-services--<service-name>`) used by the post-deploy verify step. Set this when the deployed Lambda name does not match the convention.
 
-Optional input: `mac-giver-caller: true` attaches the mac-giver caller security group in addition to the shared lambda SG. Set this only on Lambdas that are authorised to call mac-giver (the IMS auth Lambdas). Requires `vpc-enabled: true`, requires the `MAC_GIVER_CALLER_SG_ID` secret to be populated in each environment, and requires the consumer's `package.json` to include `${env.MAC_GIVER_CALLER_SG_ID}` in `hlx.awsVpcSecurityGroupIds`:
+Optional input: `mac-giver-caller: true` attaches the mac-giver caller security group in addition to the shared lambda SG. Set this only on Lambdas that are authorised to call mac-giver (the IMS auth Lambdas). Requires `vpc-enabled: true`, requires the `MAC_GIVER_CALLER_SG_ID` secret to be populated in each environment the feature is active in, and requires the consumer's `package.json` to include `${env.MAC_GIVER_CALLER_SG_ID}` in `hlx.awsVpcSecurityGroupIds`:
 
 ```yaml
 jobs:
@@ -72,6 +72,29 @@ jobs:
 ```
 
 The post-deploy verify step additionally asserts that the deployed Lambda's `VpcConfig.SecurityGroupIds` contains `MAC_GIVER_CALLER_SG_ID`.
+
+### Rolling mac-giver-caller out per environment
+
+`mac-giver-caller-environments` (CSV, default empty = all envs) restricts the feature to a specific list of GitHub Environments. Use this when the `MAC_GIVER_CALLER_SG_ID` secret is staged into one environment at a time:
+
+```yaml
+jobs:
+  ci:
+    uses: adobe/mysticat-ci/.github/workflows/service-ci.yaml@v3
+    with:
+      service-name: auth-service
+      vpc-enabled: true
+      mac-giver-caller: true
+      mac-giver-caller-environments: "dev-branches"   # stage/prod no-op until added
+    secrets: inherit
+```
+
+Environments not in the list:
+- skip the `MAC_GIVER_CALLER_SG_ID` secret-required check
+- export `MAC_GIVER_CALLER_SG_ID=""` to helix-deploy (the caller SG is NOT attached)
+- skip the post-deploy "is the caller SG attached?" assertion
+
+Add an environment to the list (and populate its secret) when you're ready to roll mac-giver forward to it.
 
 Consumers that do not need VPC attachment can stay on `@v1` indefinitely; `v2` does not deprecate `v1`, it just ships the opt-in behavior.
 
