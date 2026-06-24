@@ -294,7 +294,22 @@ jobs:
             if [ -z "$MAC_GIVER_CALLER_ENVIRONMENTS" ]; then
               MAC_GIVER_ACTIVE=true
             else
-              case ",${MAC_GIVER_CALLER_ENVIRONMENTS}," in
+              # Strip whitespace so natural CSV formatting ("dev-branches, stage")
+              # matches reliably. GitHub Environment names contain no spaces.
+              NORMALIZED_ENVS="${MAC_GIVER_CALLER_ENVIRONMENTS//[[:space:]]/}"
+              # Validate each entry against the known set so typos like "Stage"
+              # or "dev-branch" fail loud instead of becoming a silent no-op.
+              IFS=',' read -ra _ALLOWED <<< "$NORMALIZED_ENVS"
+              for _e in "${_ALLOWED[@]}"; do
+                case "$_e" in
+                  dev-branches|stage|prod|"") ;;
+                  *)
+                    echo "::error::mac-giver-caller-environments contains unknown env '${_e}'. Valid values: dev-branches, stage, prod"
+                    exit 1
+                    ;;
+                esac
+              done
+              case ",${NORMALIZED_ENVS}," in
                 *",${THIS_ENV},"*) MAC_GIVER_ACTIVE=true ;;
               esac
             fi
@@ -424,7 +439,22 @@ jobs:
             if [ -z "$MAC_GIVER_CALLER_ENVIRONMENTS" ]; then
               MAC_GIVER_ACTIVE=true
             else
-              case ",${MAC_GIVER_CALLER_ENVIRONMENTS}," in
+              # Strip whitespace so natural CSV formatting ("dev-branches, stage")
+              # matches reliably. GitHub Environment names contain no spaces.
+              NORMALIZED_ENVS="${MAC_GIVER_CALLER_ENVIRONMENTS//[[:space:]]/}"
+              # Validate each entry against the known set so typos like "Stage"
+              # or "dev-branch" fail loud instead of becoming a silent no-op.
+              IFS=',' read -ra _ALLOWED <<< "$NORMALIZED_ENVS"
+              for _e in "${_ALLOWED[@]}"; do
+                case "$_e" in
+                  dev-branches|stage|prod|"") ;;
+                  *)
+                    echo "::error::mac-giver-caller-environments contains unknown env '${_e}'. Valid values: dev-branches, stage, prod"
+                    exit 1
+                    ;;
+                esac
+              done
+              case ",${NORMALIZED_ENVS}," in
                 *",${THIS_ENV},"*) MAC_GIVER_ACTIVE=true ;;
               esac
             fi
@@ -580,7 +610,22 @@ jobs:
             if [ -z "$MAC_GIVER_CALLER_ENVIRONMENTS" ]; then
               MAC_GIVER_ACTIVE=true
             else
-              case ",${MAC_GIVER_CALLER_ENVIRONMENTS}," in
+              # Strip whitespace so natural CSV formatting ("dev-branches, stage")
+              # matches reliably. GitHub Environment names contain no spaces.
+              NORMALIZED_ENVS="${MAC_GIVER_CALLER_ENVIRONMENTS//[[:space:]]/}"
+              # Validate each entry against the known set so typos like "Stage"
+              # or "dev-branch" fail loud instead of becoming a silent no-op.
+              IFS=',' read -ra _ALLOWED <<< "$NORMALIZED_ENVS"
+              for _e in "${_ALLOWED[@]}"; do
+                case "$_e" in
+                  dev-branches|stage|prod|"") ;;
+                  *)
+                    echo "::error::mac-giver-caller-environments contains unknown env '${_e}'. Valid values: dev-branches, stage, prod"
+                    exit 1
+                    ;;
+                esac
+              done
+              case ",${NORMALIZED_ENVS}," in
                 *",${THIS_ENV},"*) MAC_GIVER_ACTIVE=true ;;
               esac
             fi
