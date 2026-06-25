@@ -91,8 +91,10 @@ jobs:
 
 Environments not in the list:
 - skip the `MAC_GIVER_CALLER_SG_ID` secret-required check
-- jq-strip the `${env.MAC_GIVER_CALLER_SG_ID}` placeholder from `package.json` `hlx.awsVpcSecurityGroupIds` before helix-deploy runs (helix-deploy refuses to deploy when the post-substitution SG array contains an empty string)
+- export `MAC_GIVER_CALLER_SG_ID` as a duplicate of `VPC_SG_ID` to the helix-deploy step (helix-deploy rejects empty entries in the SG array; the duplicate makes hedy see `["sg-lambda", "sg-lambda"]`, which AWS deduplicates so the Lambda ends up attached only to the lambda SG)
 - skip the post-deploy "is the caller SG attached?" assertion
+
+**Why duplicate `VPC_SG_ID` instead of stripping the placeholder?** Earlier versions of this workflow stripped `${env.MAC_GIVER_CALLER_SG_ID}` from `package.json` before invoking hedy. That worked for the deploy itself but had a destructive side effect on the `semantic-release` job: `@semantic-release/git` runs in the `prepare` phase *before* `@semantic-release/exec`, so it staged and committed the stripped `package.json` as part of the release commit, permanently removing the placeholder from `main`. The duplicate-`VPC_SG_ID` approach leaves `package.json` untouched.
 
 Add an environment to the list (and populate its secret) when you're ready to roll mac-giver forward to it.
 
