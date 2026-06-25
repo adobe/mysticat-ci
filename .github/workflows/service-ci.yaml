@@ -334,7 +334,7 @@ jobs:
             if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
               echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
             elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
-              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist); duping VPC_SG_ID into the slot so hedy accepts the deploy"
             fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
@@ -347,20 +347,6 @@ jobs:
             fi
           fi
 
-      - name: Strip mac-giver-caller placeholder from package.json (when skipped in this env)
-        if: inputs.mac-giver-caller && env.MAC_GIVER_ACTIVE != 'true'
-        run: |
-          # When mac-giver-caller is enabled for the workflow but disabled for
-          # this specific GitHub Environment via mac-giver-caller-environments,
-          # the MAC_GIVER_CALLER_SG_ID export is empty. hedy then sees
-          # ["sg-real", ""] in hlx.awsVpcSecurityGroupIds and refuses to deploy
-          # with "aws-vpc-security-group-ids contains an empty string".
-          # Strip the literal placeholder so hedy sees a clean single-SG array.
-          jq '(.hlx.awsVpcSecurityGroupIds) |= map(select(. != "${env.MAC_GIVER_CALLER_SG_ID}"))' \
-            package.json > package.json.tmp && mv package.json.tmp package.json
-          echo "Dropped \${env.MAC_GIVER_CALLER_SG_ID} from package.json hlx.awsVpcSecurityGroupIds"
-          jq '.hlx.awsVpcSecurityGroupIds' package.json
-
       - name: Semantic Release
         run: npm run semantic-release
         env:
@@ -371,7 +357,12 @@ jobs:
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
           VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
-          MAC_GIVER_CALLER_SG_ID: ${{ env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
+          # When mac-giver is gated off for this env, dupe VPC_SG_ID into
+          # MAC_GIVER_CALLER_SG_ID so hedy gets a non-empty value (it rejects
+          # empty entries) and the resulting ["sg-lambda","sg-lambda"] is
+          # deduplicated by AWS — Lambda ends up attached only to the lambda
+          # SG. No package.json mutation, so the release commit stays clean.
+          MAC_GIVER_CALLER_SG_ID: ${{ inputs.mac-giver-caller && (env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || secrets.VPC_SG_ID) || '' }}
 
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
@@ -493,7 +484,7 @@ jobs:
             if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
               echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
             elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
-              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist); duping VPC_SG_ID into the slot so hedy accepts the deploy"
             fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
@@ -506,15 +497,6 @@ jobs:
             fi
           fi
 
-      - name: Strip mac-giver-caller placeholder from package.json (when skipped in this env)
-        if: inputs.mac-giver-caller && env.MAC_GIVER_ACTIVE != 'true'
-        run: |
-          # See semantic-release job for rationale. Same fix.
-          jq '(.hlx.awsVpcSecurityGroupIds) |= map(select(. != "${env.MAC_GIVER_CALLER_SG_ID}"))' \
-            package.json > package.json.tmp && mv package.json.tmp package.json
-          echo "Dropped \${env.MAC_GIVER_CALLER_SG_ID} from package.json hlx.awsVpcSecurityGroupIds"
-          jq '.hlx.awsVpcSecurityGroupIds' package.json
-
       - name: Deploy to Stage
         run: npm run deploy-stage
         env:
@@ -523,7 +505,12 @@ jobs:
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
           VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
-          MAC_GIVER_CALLER_SG_ID: ${{ env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
+          # When mac-giver is gated off for this env, dupe VPC_SG_ID into
+          # MAC_GIVER_CALLER_SG_ID so hedy gets a non-empty value (it rejects
+          # empty entries) and the resulting ["sg-lambda","sg-lambda"] is
+          # deduplicated by AWS — Lambda ends up attached only to the lambda
+          # SG. No package.json mutation, so the release commit stays clean.
+          MAC_GIVER_CALLER_SG_ID: ${{ inputs.mac-giver-caller && (env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || secrets.VPC_SG_ID) || '' }}
 
       - name: Verify Lambda VPC attachment
         if: inputs.vpc-enabled
@@ -673,7 +660,7 @@ jobs:
             if [ "$MAC_GIVER_ACTIVE" = "true" ]; then
               echo "Applying mac-giver caller SG: $MAC_GIVER_CALLER_SG_ID"
             elif [ "$MAC_GIVER_CALLER_ENABLED" = "true" ]; then
-              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist)"
+              echo "Skipping mac-giver caller SG attach in '${THIS_ENV}' (not in mac-giver-caller-environments allowlist); duping VPC_SG_ID into the slot so hedy accepts the deploy"
             fi
           else
             if [ "$HAS_VPC_HLX" = "1" ]; then
@@ -686,15 +673,6 @@ jobs:
             fi
           fi
 
-      - name: Strip mac-giver-caller placeholder from package.json (when skipped in this env)
-        if: steps.main-check.outputs.skip_deploy != 'true' && inputs.mac-giver-caller && env.MAC_GIVER_ACTIVE != 'true'
-        run: |
-          # See semantic-release job for rationale. Same fix.
-          jq '(.hlx.awsVpcSecurityGroupIds) |= map(select(. != "${env.MAC_GIVER_CALLER_SG_ID}"))' \
-            package.json > package.json.tmp && mv package.json.tmp package.json
-          echo "Dropped \${env.MAC_GIVER_CALLER_SG_ID} from package.json hlx.awsVpcSecurityGroupIds"
-          jq '.hlx.awsVpcSecurityGroupIds' package.json
-
       - name: Branch Deployment
         id: deploy
         if: steps.main-check.outputs.skip_deploy != 'true'
@@ -705,7 +683,12 @@ jobs:
           VPC_SUBNET_1: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_1 || '' }}
           VPC_SUBNET_2: ${{ inputs.vpc-enabled && secrets.VPC_SUBNET_2 || '' }}
           VPC_SG_ID: ${{ inputs.vpc-enabled && secrets.VPC_SG_ID || '' }}
-          MAC_GIVER_CALLER_SG_ID: ${{ env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || '' }}
+          # When mac-giver is gated off for this env, dupe VPC_SG_ID into
+          # MAC_GIVER_CALLER_SG_ID so hedy gets a non-empty value (it rejects
+          # empty entries) and the resulting ["sg-lambda","sg-lambda"] is
+          # deduplicated by AWS — Lambda ends up attached only to the lambda
+          # SG. No package.json mutation, so the release commit stays clean.
+          MAC_GIVER_CALLER_SG_ID: ${{ inputs.mac-giver-caller && (env.MAC_GIVER_ACTIVE == 'true' && secrets.MAC_GIVER_CALLER_SG_ID || secrets.VPC_SG_ID) || '' }}
 
       - name: Verify Lambda VPC attachment
         if: steps.main-check.outputs.skip_deploy != 'true' && inputs.vpc-enabled
