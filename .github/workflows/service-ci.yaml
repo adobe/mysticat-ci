@@ -192,7 +192,11 @@ jobs:
 
   it-postgres:
     runs-on: ubuntu-latest
-    needs: build
+    # No `needs: build` — this job does its own checkout + npm ci and
+    # doesn't consume any build-job output, so it doesn't need to wait on
+    # it. Running it in parallel with `build` instead of after it roughly
+    # halves PR wall-clock time (build and it-postgres are each ~5-7min;
+    # sequential means paying both, parallel means paying the slower one).
     if: inputs.it-postgres
     timeout-minutes: 15
     steps:
