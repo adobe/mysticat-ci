@@ -37,6 +37,7 @@ set -euo pipefail
 log_err()  { echo "::error::release-cm: $*" >&2; }
 log_warn() { echo "::warning::release-cm: $*" >&2; }
 die()      { log_err "$*"; exit 1; }
+errf=""; trap 'rm -f "${errf:-}"' EXIT
 
 # --- §3.1.1 severity helpers (rank <-> name; validation) ---
 impact_rank() { case "$1" in no-impact) echo 0;; unnoticeable) echo 1;; degradation) echo 2;; outage) echo 3;; *) echo -1;; esac; }
@@ -62,12 +63,17 @@ service_ids=$(awk '
   }
   found==0 && /^[[:space:]]*serviceIds:[[:space:]]*(#.*)?$/ { inblk=1; next }
   inblk==1 {
-    if ($0 ~ /^[[:space:]]*-[[:space:]]*[0-9]+/) { n=$0; gsub(/[^0-9]/,"",n); out=out (out==""?"":",") n; next }
-    if ($0 ~ /^[[:space:]]*(#.*)?$/) { next }
-    inblk=0
+    if ($0 ~ /^[[:space:]]*-[[:space:]]*[0-9]+[[:space:]]*(#.*)?$/) {
+      n=$0; sub(/^[[:space:]]*-[[:space:]]*/,"",n); sub(/[^0-9].*$/,"",n); out=out (out==""?"":",") n; next
+    }
+    if ($0 ~ /^[[:space:]]*-/)          { bad=1; next }   # a list item that is not a bare integer => malformed
+    if ($0 ~ /^[[:space:]]*(#.*)?$/)    { next }          # blank or comment inside the list is fine
+    inblk=0                                                # dedent / next key => list ended
   }
-  END { print out }
+  END { if (bad) print "!MALFORMED"; else print out }
 ' "$SNOW_YML")
+[ "$service_ids" != "!MALFORMED" ] \
+  || die "$SNOW_YML serviceIds list has a non-integer entry (fix the .snow.yml; release left unmodified)"
 printf '%s' "$service_ids" | grep -qE '^[0-9]+(,[0-9]+)*$' \
   || die "$SNOW_YML has no parseable serviceIds (expected inline [id, id] or a block list of integers); got: '${service_ids}'"
 ids_fmt=$(printf '%s' "$service_ids" | sed 's/,/, /g')
@@ -83,10 +89,18 @@ fi
 # --- Non-critical fields: degrade to "unknown" rather than fail.
 published=$(gh release view "$TAG" -R "$REPO" --json publishedAt -q .publishedAt 2>/dev/null || true)
 case "$published" in ""|null) published=unknown;; esac
-prev=$(gh release list -R "$REPO" -L 200 --json tagName,isDraft,isPrerelease \
-  -q '[.[]|select(.isDraft==false and .isPrerelease==false)|.tagName]|.[]' 2>/dev/null \
+# Keep $TAG in the candidate list (even if it is a prerelease) so the anchor is found;
+# only prod (non-draft, non-prerelease) releases are eligible as the backout target.
+prev=$(gh release list -R "$REPO" -L 200 --json tagName,isDraft,isPrerelease 2>/dev/null \
+  | jq -r --arg t "$TAG" '[.[]|select((.isDraft==false and .isPrerelease==false) or .tagName==$t)|.tagName]|.[]' 2>/dev/null \
   | awk -v t="$TAG" 'found{print; exit} $0==t{found=1}' || true)
 [ -n "$prev" ] || prev=unknown
+
+# --- Verify the token can actually see pull requests, so a genuine issue-ref (skipped
+# below) is never confused with a PR made invisible by a missing scope — which would
+# otherwise skip every PR and record a green, evidence-free release (fail open).
+gh pr list -R "$REPO" -L 1 >/dev/null 2>&1 \
+  || die "cannot list pull requests in $REPO — check the token's pull-requests:read scope and repo access (release left unmodified)"
 
 # --- Merged PRs referenced in the release notes (semantic-release links them as #NNN).
 pr_nums=$(printf '%s\n' "$body" | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)
@@ -94,7 +108,7 @@ n_refs=$(printf '%s' "$pr_nums" | wc -w | tr -d ' ')
 [ "${n_refs:-0}" -gt 200 ] && log_warn "release references $n_refs PR/issue refs; processing all of them"
 
 changes=""; high_risk=""; n_changes=0; n_assessed=0
-agg_impact=1; agg_risk=0; agg_ctype=0   # baseline floor: unnoticeable / minor / standard
+agg_impact=-1; agg_risk=-1; agg_ctype=0   # -1 = no PR seen yet; per-PR baseline is applied below
 for n in $pr_nums; do
   errf=$(mktemp)
   if ! pr_json=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews,body 2>"$errf"); then
@@ -131,18 +145,24 @@ for n in $pr_nums; do
   pr_body=$(printf '%s' "$pr_json" | jq -r '.body // ""')
   pr_impact=""; pr_risk=""; pr_ctype=""
   if printf '%s\n' "$pr_body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$'; then
+    # Take the LAST complete (fenced) block. A marker with no closing fence yields nothing.
     blk=$(printf '%s\n' "$pr_body" | awk '
       /^[[:space:]]*cm-assessment: v1[[:space:]]*$/ { cap=1; buf=$0 ORS; next }
       cap && /^[[:space:]]*```/ { last=buf; cap=0; next }
       cap { buf=buf $0 ORS }
       END { printf "%s", last }')
-    pr_impact=$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*impact:[[:space:]]*([^[:space:]#]+).*/\1/p'     | head -1)
-    pr_risk=$(printf   '%s' "$blk" | sed -nE 's/^[[:space:]]*risk:[[:space:]]*([^[:space:]#]+).*/\1/p'       | head -1)
-    pr_ctype=$(printf  '%s' "$blk" | sed -nE 's/^[[:space:]]*changeType:[[:space:]]*([^[:space:]#]+).*/\1/p' | head -1)
+    [ -n "$blk" ] || die "PR #$n has a cm-assessment marker but the block is not properly fenced (release left unmodified)"
+    # Values are case-insensitive; extract the raw token then lowercase and validate.
+    lc() { printf '%s' "$1" | tr "[:upper:]" "[:lower:]"; }
+    pr_impact=$(lc "$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*impact:[[:space:]]*([^[:space:]#]+).*/\1/p'     | head -1)")
+    pr_risk=$(lc "$(printf   '%s' "$blk" | sed -nE 's/^[[:space:]]*risk:[[:space:]]*([^[:space:]#]+).*/\1/p'       | head -1)")
+    pr_ctype=$(lc "$(printf  '%s' "$blk" | sed -nE 's/^[[:space:]]*changeType:[[:space:]]*([^[:space:]#]+).*/\1/p' | head -1)")
     [ -z "$pr_impact" ] || valid_impact "$pr_impact" || die "PR #$n cm-assessment: invalid impact '${pr_impact}' (expected no-impact|unnoticeable|degradation|outage)"
     [ -z "$pr_risk" ]   || valid_risk   "$pr_risk"   || die "PR #$n cm-assessment: invalid risk '${pr_risk}' (expected minor|major)"
     [ -z "$pr_ctype" ]  || valid_ctype  "$pr_ctype"  || die "PR #$n cm-assessment: invalid changeType '${pr_ctype}' (expected standard|normal|emergency)"
-    [ -n "${pr_impact}${pr_risk}${pr_ctype}" ] && n_assessed=$((n_assessed + 1))
+    [ -n "${pr_impact}${pr_risk}${pr_ctype}" ] \
+      || die "PR #$n has a cm-assessment block with none of impact/risk/changeType (release left unmodified)"
+    n_assessed=$((n_assessed + 1))
   fi
 
   # Aggregate = max. Unassessed PRs use the §3.1.1 baseline so they never lower the rating.
@@ -164,6 +184,11 @@ done
 changes="${changes%$'\n'}"
 if [ "$n_changes" -eq 0 ]; then changes_block="changes: []"; else changes_block="changes:                     # one entry per merged PR
 ${changes}"; fi
+[ "$n_changes" -eq 0 ] && [ "${n_refs:-0}" -gt 0 ] && log_warn "referenced ${n_refs} #number(s) but none were pull requests — recorded as a no-PR release"
+
+# No PR seen at all: fall back to the §3.1.1 baseline (unnoticeable / minor).
+[ "$agg_impact" -lt 0 ] && agg_impact=1
+[ "$agg_risk" -lt 0 ]   && agg_risk=0
 
 # --- Resolve impact/risk, apply the escalate-only label floor, derive the change model.
 impact=$(impact_name "$agg_impact")
@@ -178,6 +203,11 @@ change_type=$(ctype_name "$agg_ctype")
 
 if [ "$n_assessed" -gt 0 ]; then assessed_from=pr-cm-assessment; else assessed_from=heuristic; fi
 coverage="${n_assessed}/${n_changes} PRs assessed"
+if [ "$prev" = unknown ]; then
+  backout="no previous release resolved (first release, or beyond the lookup window) — document a specific rollback"
+else
+  backout="redeploy the previous release ${prev}"
+fi
 
 block=$(cat <<EOF
 
@@ -194,7 +224,7 @@ assessedCoverage: "${coverage}"
 environment: production
 ${changes_block}
 tested: "see this release's CI checks and post-deploy validation"
-backoutPlan: "redeploy the previous release ${prev}"
+backoutPlan: "${backout}"
 window: { start: "${published}" }
 correlationId: "${TAG}"
 cmr: null
