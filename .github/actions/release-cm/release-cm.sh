@@ -7,29 +7,30 @@
 #     log ::error:: and EXIT WITHOUT MODIFYING the release. Never a partial/guessed record,
 #     never an error written into the release notes.
 #   * ASSESSMENT-CONTENT problems — a PR whose cm-assessment block is unparseable, has an
-#     invalid value, or is missing impact/risk/changeType, or a cmr:high-risk label that
-#     conflicts with the PR's own low self-assessment — do NOT abort. The release is still
-#     recorded, with `assessmentStatus: needs-review` so a human knows to look, rather than
+#     invalid value, is missing impact/risk/changeType, uses a multi-line backout we cannot
+#     capture, or a cmr:high-risk label that conflicts with the PR's own low self-assessment
+#     — do NOT abort. The release is still recorded, with `assessmentStatus: needs-review`
+#     (and the offending field shown as `unknown`) so a human knows to look, rather than
 #     silently defaulting to low or blocking the whole release over one PR.
 #
 # assessmentStatus (the coverage signal a human scans for):
 #   assessed      every merged PR carried a valid cm-assessment  ("assessed low-risk" = this + low values)
 #   partial       some PRs assessed, the rest floored to the §3.1.1 baseline
 #   unassessed    no PR carried an assessment (heuristic baseline) — worth a look
-#   needs-review  a PR's assessment was unparseable/invalid, or a label/assessment conflict
+#   needs-review  a PR's assessment was unparseable/invalid/incomplete, or a label/assessment conflict
 #
 # Values:
 #   serviceIds    the repo's .snow.yml (required; inline `[a, b]` or block list of integers).
-#   impact/risk   the aggregate (highest) across the PRs — each PR's cm-assessment block
-#                 (written at PR time by the `cmr` skill) when present, else the §3.1.1
-#                 baseline (unnoticeable/minor). Unassessed/unknown PRs floor at the
-#                 baseline, so assessing a PR can only raise the rating. The cmr:high-risk
-#                 label is an optional escalate-only floor (the block is the primary signal).
+#   impact/risk   the aggregate (highest) across the PRs. An UNASSESSED or UNKNOWN field
+#                 floors at the §3.1.1 baseline (unnoticeable/minor); an ASSESSED PR uses its
+#                 own value (which may be no-impact); the release takes the max. The
+#                 cmr:high-risk label is an optional escalate-only floor (block = primary signal).
 #   changeType    max of the PRs' declared changeType and the severity-derived model.
 #   changes[]     per merged PR: author, approving reviewer login(s) (each reviewer's latest
-#                 review, kept only if APPROVED), independentlyApproved (a reviewer other
-#                 than the author approved — human OR AI agent, an ai-native org), the PR's
-#                 own impact/risk (or unknown when unparseable), and its backout if provided.
+#                 review, kept only if APPROVED), independentlyApproved (a reviewer other than
+#                 the author AND not the CI identity approved — human or AI agent; an
+#                 approval-independence signal, not a full SoD attestation), the PR's own
+#                 impact/risk (or `unknown` per field when invalid), and its backout if given.
 #
 # Content in the repos is trusted; the script validates for syntax mistakes only. A human
 # can override the result: the script never overwrites an existing block, so editing the
@@ -47,7 +48,12 @@ log_err()  { echo "::error::release-cm: $*" >&2; }
 log_warn() { echo "::warning::release-cm: $*" >&2; }
 die()      { log_err "$*"; exit 1; }
 lc()       { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+yamlstr()  { jq -Rn --arg s "$1" '$s'; }   # encode arbitrary text as a valid (quoted) YAML/JSON scalar
 errf=""; trap 'rm -f "${errf:-}"' EXIT
+
+# Reviewer logins that are the CI/publishing identity, not an independent reviewer — an
+# auto-approve step running as one of these is self-approval by proxy, not segregation.
+CI_IDENTITIES="github-actions[bot]"
 
 # --- §3.1.1 severity helpers (rank <-> name; validation) ---
 impact_rank() { case "$1" in no-impact) echo 0;; unnoticeable) echo 1;; degradation) echo 2;; outage) echo 3;; *) echo -1;; esac; }
@@ -135,8 +141,10 @@ for n in $pr_nums; do
   [ "$(printf '%s' "$pr_json" | jq -r '(([.labels[].name]|index("cmr:high-risk"))!=null)')" = "true" ] && high_risk=1
 
   # Approving reviewers: each reviewer's LATEST review, kept only if its state is APPROVED.
-  # independentlyApproved = a reviewer other than the author approved — human OR AI agent
-  # (an ai-native org treats an agent's independent review as valid segregation of duties).
+  # independentlyApproved = a reviewer other than the author AND not the CI/publishing
+  # identity approved — human OR AI agent (an approval-independence signal, not a full SoD
+  # attestation; whether an agent approval satisfies the CM Standard's SoD is a CM Process
+  # Owner question). Only the CI identity is excluded, so a real reviewing agent still counts.
   approvers=$(printf '%s' "$pr_json" | jq -r \
     '[.reviews[]|select(.author.login!=null)]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="APPROVED"))|.[].author.login' \
     2>/dev/null || true)
@@ -145,16 +153,17 @@ for n in $pr_nums; do
     arr=""
     while IFS= read -r rev; do
       [ -n "$rev" ] || continue
-      arr="${arr:+$arr, }\"${rev}\""
-      [ "$rev" != "$a" ] && independent=true
+      arr="${arr:+$arr, }$(yamlstr "$rev")"
+      [ "$rev" != "$a" ] && ! printf '%s\n' $CI_IDENTITIES | grep -qxF "$rev" && independent=true
     done <<<"$approvers"
     approved_arr="[${arr}]"
   fi
 
-  # PR cm-assessment block (the LAST one wins). Assessment-content problems mark the PR
-  # `unknown` and set needs-review — they do NOT abort or silently default to low.
+  # PR cm-assessment block (the LAST one wins). Per-field: a present-but-invalid value is
+  # shown as `unknown` and flags needs-review; a structurally broken block flags the PR.
   pr_body=$(printf '%s' "$pr_json" | jq -r '.body // ""')
-  pr_impact=""; pr_risk=""; pr_ctype=""; pr_backout=""; pr_unknown=""
+  pr_impact=""; pr_risk=""; pr_ctype=""; pr_backout=""
+  impact_bad=""; risk_bad=""; flag=""; unparsed=""
   if printf '%s\n' "$pr_body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$'; then
     blk=$(printf '%s\n' "$pr_body" | awk '
       /^[[:space:]]*cm-assessment: v1[[:space:]]*$/ { cap=1; buf=$0 ORS; next }
@@ -162,45 +171,46 @@ for n in $pr_nums; do
       cap { buf=buf $0 ORS }
       END { printf "%s", last }')
     if [ -z "$blk" ]; then
-      pr_unknown=1; log_warn "PR #$n: cm-assessment marker with no closed fenced block — marked needs-review"
+      unparsed=1; flag=1; log_warn "PR #$n: cm-assessment marker with no closed fenced block — needs-review"
     else
       pr_impact=$(lc "$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*impact:[[:space:]]*([^[:space:]#]+).*/\1/p'     | head -1)")
       pr_risk=$(lc "$(printf   '%s' "$blk" | sed -nE 's/^[[:space:]]*risk:[[:space:]]*([^[:space:]#]+).*/\1/p'       | head -1)")
       pr_ctype=$(lc "$(printf  '%s' "$blk" | sed -nE 's/^[[:space:]]*changeType:[[:space:]]*([^[:space:]#]+).*/\1/p' | head -1)")
       pr_backout=$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*backout:[[:space:]]*(.+)$/\1/p' | head -1)
-      pr_backout=${pr_backout%\"}; pr_backout=${pr_backout#\"}
-      if [ -n "$pr_impact" ] && ! valid_impact "$pr_impact"; then pr_unknown=1; log_warn "PR #$n: invalid impact '${pr_impact}' — marked needs-review"; pr_impact=""; fi
-      if [ -n "$pr_risk" ]   && ! valid_risk   "$pr_risk";   then pr_unknown=1; log_warn "PR #$n: invalid risk '${pr_risk}' — marked needs-review";   pr_risk=""; fi
-      if [ -n "$pr_ctype" ]  && ! valid_ctype  "$pr_ctype";  then pr_unknown=1; log_warn "PR #$n: invalid changeType '${pr_ctype}' — marked needs-review"; pr_ctype=""; fi
-      if [ -z "${pr_impact}${pr_risk}${pr_ctype}" ] && [ -z "$pr_unknown" ]; then
-        pr_unknown=1; log_warn "PR #$n: cm-assessment has none of impact/risk/changeType — marked needs-review"
+      case "$pr_backout" in '"'*'"') pr_backout=${pr_backout#\"}; pr_backout=${pr_backout%\"};; esac  # strip only matched surrounding quotes
+      # A multi-line block scalar (| or >) cannot be captured single-line — flag, don't emit garbage.
+      case "$pr_backout" in '|'*|'>'*) log_warn "PR #$n: multi-line backout not captured (use a single-line backout) — needs-review"; pr_backout=""; flag=1;; esac
+      if [ -n "$pr_impact" ] && ! valid_impact "$pr_impact"; then impact_bad=1; flag=1; log_warn "PR #$n: invalid impact '${pr_impact}' — needs-review"; pr_impact=""; fi
+      if [ -n "$pr_risk" ]   && ! valid_risk   "$pr_risk";   then risk_bad=1;   flag=1; log_warn "PR #$n: invalid risk '${pr_risk}' — needs-review";   pr_risk=""; fi
+      if [ -n "$pr_ctype" ]  && ! valid_ctype  "$pr_ctype";  then flag=1;               log_warn "PR #$n: invalid changeType '${pr_ctype}' — needs-review"; pr_ctype=""; fi
+      if [ -z "${pr_impact}${pr_risk}${pr_ctype}" ] && [ -z "${impact_bad}${risk_bad}${flag}" ]; then
+        unparsed=1; flag=1; log_warn "PR #$n: cm-assessment has none of impact/risk/changeType — needs-review"
       fi
-      [ -z "$pr_unknown" ] && [ -n "${pr_impact}${pr_risk}${pr_ctype}" ] && n_assessed=$((n_assessed + 1))
+      [ -n "${pr_impact}${pr_risk}${pr_ctype}" ] && n_assessed=$((n_assessed + 1))
     fi
-    if [ -n "$pr_unknown" ]; then n_unknown=$((n_unknown + 1)); needs_review=1; fi
+    [ -n "$flag" ] && { n_unknown=$((n_unknown + 1)); needs_review=1; }
   fi
 
-  # Aggregate = max. Unassessed/unknown PRs use the baseline so they never lower the rating.
+  # Aggregate = max. Unassessed/unknown fields use the baseline so they never lower the rating.
   ir=$(impact_rank "${pr_impact:-unnoticeable}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
   rr=$(risk_rank "${pr_risk:-minor}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
   if [ -n "$pr_ctype" ]; then cr=$(ctype_rank "$pr_ctype"); [ "$cr" -gt "$agg_ctype" ] && agg_ctype=$cr; fi
 
+  # Per-PR display: each field shows its value if valid, `unknown` if present-but-invalid or
+  # the block was structurally unusable, and is omitted if the PR simply carried no assessment.
+  di=""; if [ -n "$pr_impact" ]; then di=$pr_impact; elif [ -n "$impact_bad" ] || [ -n "$unparsed" ]; then di=unknown; fi
+  dr=""; if [ -n "$pr_risk" ];   then dr=$pr_risk;   elif [ -n "$risk_bad" ]   || [ -n "$unparsed" ]; then dr=unknown; fi
   extra=""
-  if [ -n "$pr_unknown" ]; then
-    extra="${extra}
-    impact: unknown
-    risk: unknown
-    note: \"cm-assessment present but unparseable/invalid — needs review\""
-  else
-    [ -n "$pr_impact" ] && extra="${extra}
-    impact: ${pr_impact}"
-    [ -n "$pr_risk" ] && extra="${extra}
-    risk: ${pr_risk}"
-  fi
+  [ -n "$di" ] && extra="${extra}
+    impact: ${di}"
+  [ -n "$dr" ] && extra="${extra}
+    risk: ${dr}"
+  [ -n "$flag" ] && extra="${extra}
+    note: \"cm-assessment unparseable/invalid — needs review\""
   [ -n "$pr_backout" ] && extra="${extra}
-    backout: \"${pr_backout}\""
+    backout: $(yamlstr "$pr_backout")"
   changes="${changes}  - pr: ${n}
-    author: \"${a}\"
+    author: $(yamlstr "$a")
     approvedBy: ${approved_arr}
     independentlyApproved: ${independent}${extra}
 "
@@ -219,8 +229,8 @@ pre_impact=$agg_impact; pre_risk=$agg_risk
 if [ -n "$high_risk" ]; then
   [ "$agg_impact" -lt 2 ] && agg_impact=2
   [ "$agg_risk" -lt 1 ]   && agg_risk=1
-  # cmr:high-risk label but the PRs' own assessments said low => conflicting signal.
-  [ "$n_assessed" -gt 0 ] && [ "$pre_impact" -lt 2 ] && [ "$pre_risk" -lt 1 ] && needs_review=1
+  # cmr:high-risk but a PR's own assessment claimed low on EITHER dimension => conflict.
+  [ "$n_assessed" -gt 0 ] && { [ "$pre_impact" -lt 2 ] || [ "$pre_risk" -lt 1 ]; } && needs_review=1
 fi
 impact=$(impact_name "$agg_impact")
 risk=$(risk_name "$agg_risk")
@@ -259,7 +269,7 @@ assessedCoverage: "${coverage}"
 environment: production
 ${changes_block}
 tested: "see this release's CI checks and post-deploy validation"
-backoutPlan: "${backout}"
+backoutPlan: $(yamlstr "$backout")
 window: { start: "${published}" }
 correlationId: "${TAG}"
 cmr: null

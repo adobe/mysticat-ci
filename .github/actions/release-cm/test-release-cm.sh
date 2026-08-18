@@ -18,8 +18,13 @@ fi
 if [ "$1" = "release" ] && [ "$2" = "view" ]; then
   case "$*" in
     *publishedAt*) cat "$FIX/published.txt" 2>/dev/null || echo null; exit 0;;
-    *body*)        cat "$FIX/release-body.txt" 2>/dev/null || echo ""; exit 0;;
+    *body*)        [ -f "$FIX/release-view-fail" ] && { echo "HTTP 502" >&2; exit 1; }
+                   cat "$FIX/release-body.txt" 2>/dev/null || echo ""; exit 0;;
   esac
+fi
+if [ "$1" = "release" ] && [ "$2" = "edit" ]; then
+  [ -f "$FIX/release-edit-fail" ] && { echo "HTTP 403" >&2; exit 1; }
+  echo edited; exit 0
 fi
 if [ "$1" = "release" ] && [ "$2" = "list" ]; then
   jq -Rn '[inputs|select(length>0)|split(" ")|{tagName:.[0],isDraft:(.[1]=="draft"),isPrerelease:(.[1]=="pre")}]' < "$FIX/releases.txt" 2>/dev/null || echo "[]"
@@ -44,6 +49,11 @@ no(){ printf 'FAIL  %s\n' "$1"; printf '      %s\n' "$2"; fail=$((fail+1)); }
 # assert_contains name needle ; assert_exit name expected
 run(){ OUT=$( cd "$FIXROOT/$1" 2>/dev/null; FIX="$FIXROOT/$1" SNOW_YML="${SNOW:-$FIXROOT/snow-inline.yml}" REPO=x/y DRY_RUN=1 bash "$SCRIPT" "$2" 2>&1 ); RC=$?; }
 has(){ case "$OUT" in *"$1"*) return 0;; *) return 1;; esac; }
+# yaml_ok: parse the emitted ```yaml block (via ruby if present; skip if no parser).
+yaml_ok(){
+  command -v ruby >/dev/null 2>&1 || return 0
+  printf '%s\n' "$OUT" | awk '/```yaml/{f=1;next}/```/{f=0}f' | ruby -ryaml -e 'YAML.safe_load(STDIN.read)' >/dev/null 2>&1
+}
 mkfix(){ mkdir -p "$FIXROOT/$1"; }
 mkpr(){ jq -n --arg a "$3" --arg b "$4" --argjson rv "$5" --argjson lb "$6" '{author:{login:$a},labels:$lb,reviews:$rv,body:$b}' > "$FIXROOT/$1/pr-$2.json"; }
 NOREV='[]'; NOLBL='[]'
@@ -161,6 +171,91 @@ mkfix T17; printf 'fixes #1701\n' > "$FIXROOT/T17/release-body.txt"; echo null >
 echo 'error: API rate limit exceeded' > "$FIXROOT/T17/pr-1701.err"
 run T17 v2
 { has '::error::' && has 'failed to look up PR #1701' && [ "$RC" -ne 0 ]; } && ok "T17 transient gh error aborts" || no "T17 transient gh error aborts" "$OUT"
+
+# ---------- T18 backout with embedded quotes -> valid YAML ----------
+mkfix T18; printf 'fixes #1801\n' > "$FIXROOT/T18/release-body.txt"; echo null > "$FIXROOT/T18/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T18/releases.txt"
+mkpr T18 1801 alice "$(blk 'impact: degradation
+risk: major
+backout: revert then run "terraform apply" in "prod"')" "$NOREV" "$NOLBL"
+run T18 v2
+{ yaml_ok && has 'backout:' && has 'terraform apply' && [ "$RC" -eq 0 ]; } && ok "T18 backout with quotes -> valid YAML" || no "T18 backout with quotes -> valid YAML" "$OUT"
+
+# ---------- T19 multi-line block-scalar backout -> needs-review, no garbage ----------
+mkfix T19; printf 'fixes #1901\n' > "$FIXROOT/T19/release-body.txt"; echo null > "$FIXROOT/T19/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T19/releases.txt"
+mkpr T19 1901 alice 'started
+## Change Management
+
+```yaml
+cm-assessment: v1
+impact: degradation
+risk: major
+backout: |
+  step 1
+  step 2
+```' "$NOREV" "$NOLBL"
+run T19 v2
+{ has 'assessmentStatus: needs-review' && ! has 'backout: "|"' && has 'impact: degradation' && yaml_ok && [ "$RC" -eq 0 ]; } \
+  && ok "T19 block-scalar backout flagged, no garbage" || no "T19 block-scalar backout flagged, no garbage" "$OUT"
+
+# ---------- T20 partial-field-invalid -> per-field display (BUG2) ----------
+mkfix T20; printf 'fixes #2001\n' > "$FIXROOT/T20/release-body.txt"; echo null > "$FIXROOT/T20/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T20/releases.txt"
+mkpr T20 2001 alice "$(blk 'impact: bogus
+risk: major')" "$NOREV" "$NOLBL"
+run T20 v2
+# per-PR entry must show impact: unknown AND risk: major (the valid field preserved), status needs-review
+{ has 'impact: unknown' && has 'risk: major' && has 'assessmentStatus: needs-review' && yaml_ok && [ "$RC" -eq 0 ]; } \
+  && ok "T20 partial-invalid keeps valid field" || no "T20 partial-invalid keeps valid field" "$OUT"
+
+# ---------- T21 three-way mix (assessed + needs-review + unassessed) ----------
+mkfix T21; printf 'fixes #2101 #2102 #2103\n' > "$FIXROOT/T21/release-body.txt"; echo null > "$FIXROOT/T21/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T21/releases.txt"
+mkpr T21 2101 alice "$(blk 'impact: degradation
+risk: major')" "$NOREV" "$NOLBL"
+mkpr T21 2102 bob "$(blk 'impact: nope')" "$NOREV" "$NOLBL"
+mkpr T21 2103 carol 'plain' "$NOREV" "$NOLBL"
+run T21 v2
+{ has 'assessmentStatus: needs-review' && has 'impact: degradation' && yaml_ok && [ "$RC" -eq 0 ]; } \
+  && ok "T21 three-way mix -> needs-review wins" || no "T21 three-way mix -> needs-review wins" "$OUT"
+
+# ---------- T22 case-insensitive enum accepted (positive path) ----------
+mkfix T22; printf 'fixes #2201\n' > "$FIXROOT/T22/release-body.txt"; echo null > "$FIXROOT/T22/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T22/releases.txt"
+mkpr T22 2201 alice "$(blk 'impact: DEGRADATION
+risk: Major
+changeType: Normal')" "$NOREV" "$NOLBL"
+run T22 v2
+{ has 'impact: degradation' && has 'risk: major' && has 'assessmentStatus: assessed' && [ "$RC" -eq 0 ]; } \
+  && ok "T22 case-insensitive accepted" || no "T22 case-insensitive accepted" "$OUT"
+
+# ---------- T23 high-risk label, no conflict (already high) -> assessed, not needs-review ----------
+mkfix T23; printf 'fixes #2301\n' > "$FIXROOT/T23/release-body.txt"; echo null > "$FIXROOT/T23/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T23/releases.txt"
+mkpr T23 2301 alice "$(blk 'impact: degradation
+risk: major')" "$NOREV" '[{"name":"cmr:high-risk"}]'
+run T23 v2
+{ has 'assessmentStatus: assessed' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T23 label w/o conflict stays assessed" || no "T23 label w/o conflict stays assessed" "$OUT"
+
+# ---------- T24 release body read failure -> abort ----------
+mkfix T24; printf 'x\n' > "$FIXROOT/T24/release-body.txt"; echo null > "$FIXROOT/T24/published.txt"; printf 'v2\n' > "$FIXROOT/T24/releases.txt"; touch "$FIXROOT/T24/release-view-fail"
+run T24 v2
+{ has '::error::' && has 'cannot read release' && [ "$RC" -ne 0 ] && ! has 'cm-attributes: v1'; } \
+  && ok "T24 body read failure aborts" || no "T24 body read failure aborts" "$OUT"
+
+# ---------- T25 non-DRY edit path (writes) ----------
+mkfix T25; printf 'fixes #2501\n' > "$FIXROOT/T25/release-body.txt"; echo null > "$FIXROOT/T25/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T25/releases.txt"
+mkpr T25 2501 alice "$(blk 'impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"
+OUT=$( cd "$FIXROOT/T25"; FIX="$FIXROOT/T25" SNOW_YML="$FIXROOT/snow-inline.yml" REPO=x/y bash "$SCRIPT" v2 2>&1 ); RC=$?
+{ has 'decorated x/y release v2' && ! has 'DRY RUN' && [ "$RC" -eq 0 ]; } && ok "T25 non-DRY edit path writes" || no "T25 non-DRY edit path writes" "$OUT"
+
+# ---------- T26 non-DRY edit failure -> die ----------
+mkfix T26; printf 'fixes #2601\n' > "$FIXROOT/T26/release-body.txt"; echo null > "$FIXROOT/T26/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T26/releases.txt"; touch "$FIXROOT/T26/release-edit-fail"
+mkpr T26 2601 alice "$(blk 'impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"
+OUT=$( cd "$FIXROOT/T26"; FIX="$FIXROOT/T26" SNOW_YML="$FIXROOT/snow-inline.yml" REPO=x/y bash "$SCRIPT" v2 2>&1 ); RC=$?
+{ has '::error::' && has 'failed to update release' && [ "$RC" -ne 0 ]; } && ok "T26 edit failure aborts" || no "T26 edit failure aborts" "$OUT"
+
+# ---------- YAML validity on the core happy-path blocks ----------
+run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
+run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"
 
 echo
 echo "-------- $pass passed, $fail failed --------"
