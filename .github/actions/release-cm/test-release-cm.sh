@@ -253,6 +253,22 @@ risk: minor')" "$NOREV" "$NOLBL"
 OUT=$( cd "$FIXROOT/T26"; FIX="$FIXROOT/T26" SNOW_YML="$FIXROOT/snow-inline.yml" REPO=x/y bash "$SCRIPT" v2 2>&1 ); RC=$?
 { has '::error::' && has 'failed to update release' && [ "$RC" -ne 0 ]; } && ok "T26 edit failure aborts" || no "T26 edit failure aborts" "$OUT"
 
+# ---------- T27 github-actions[bot] (CI identity) approver -> NOT independent ----------
+mkfix T27; printf 'fixes #2701\n' > "$FIXROOT/T27/release-body.txt"; echo null > "$FIXROOT/T27/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T27/releases.txt"
+mkpr T27 2701 alice 'x' '[{"author":{"login":"github-actions[bot]"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+run T27 v2
+{ has 'approvedBy: ["github-actions[bot]"]' && has 'independentlyApproved: false' && [ "$RC" -eq 0 ]; } \
+  && ok "T27 CI identity not independent" || no "T27 CI identity not independent" "$OUT"
+
+# ---------- T28 single-line backout that starts with > -> NOT flagged, kept ----------
+mkfix T28; printf 'fixes #2801\n' > "$FIXROOT/T28/release-body.txt"; echo null > "$FIXROOT/T28/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T28/releases.txt"
+mkpr T28 2801 alice "$(blk 'impact: degradation
+risk: major
+backout: "> rollback via the feature flag toggle"')" "$NOREV" "$NOLBL"
+run T28 v2
+{ has 'assessmentStatus: assessed' && has 'rollback via the feature flag toggle' && ! has 'assessmentStatus: needs-review' && yaml_ok && [ "$RC" -eq 0 ]; } \
+  && ok "T28 free-text backout starting with > kept" || no "T28 free-text backout starting with > kept" "$OUT"
+
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"

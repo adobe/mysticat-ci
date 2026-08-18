@@ -154,7 +154,7 @@ for n in $pr_nums; do
     while IFS= read -r rev; do
       [ -n "$rev" ] || continue
       arr="${arr:+$arr, }$(yamlstr "$rev")"
-      [ "$rev" != "$a" ] && ! printf '%s\n' $CI_IDENTITIES | grep -qxF "$rev" && independent=true
+      [ "$rev" != "$a" ] && ! grep -qxF -- "$rev" <<<"$CI_IDENTITIES" && independent=true
     done <<<"$approvers"
     approved_arr="[${arr}]"
   fi
@@ -178,8 +178,13 @@ for n in $pr_nums; do
       pr_ctype=$(lc "$(printf  '%s' "$blk" | sed -nE 's/^[[:space:]]*changeType:[[:space:]]*([^[:space:]#]+).*/\1/p' | head -1)")
       pr_backout=$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*backout:[[:space:]]*(.+)$/\1/p' | head -1)
       case "$pr_backout" in '"'*'"') pr_backout=${pr_backout#\"}; pr_backout=${pr_backout%\"};; esac  # strip only matched surrounding quotes
-      # A multi-line block scalar (| or >) cannot be captured single-line — flag, don't emit garbage.
-      case "$pr_backout" in '|'*|'>'*) log_warn "PR #$n: multi-line backout not captured (use a single-line backout) — needs-review"; pr_backout=""; flag=1;; esac
+      # A multi-line block scalar header (exactly |, >, optionally an indent digit / chomp,
+      # and nothing else on the line) cannot be captured single-line — flag it. Free text
+      # that merely starts with | or > (e.g. "> rollback via flag") is kept.
+      case "$pr_backout" in
+        '|'|'>'|'|'[-+]|'>'[-+]|'|'[0-9]|'>'[0-9]|'|'[0-9][-+]|'>'[0-9][-+]|'|'[-+][0-9]|'>'[-+][0-9])
+          log_warn "PR #$n: multi-line backout not captured (use a single-line backout) — needs-review"; pr_backout=""; flag=1;;
+      esac
       if [ -n "$pr_impact" ] && ! valid_impact "$pr_impact"; then impact_bad=1; flag=1; log_warn "PR #$n: invalid impact '${pr_impact}' — needs-review"; pr_impact=""; fi
       if [ -n "$pr_risk" ]   && ! valid_risk   "$pr_risk";   then risk_bad=1;   flag=1; log_warn "PR #$n: invalid risk '${pr_risk}' — needs-review";   pr_risk=""; fi
       if [ -n "$pr_ctype" ]  && ! valid_ctype  "$pr_ctype";  then flag=1;               log_warn "PR #$n: invalid changeType '${pr_ctype}' — needs-review"; pr_ctype=""; fi
@@ -246,7 +251,7 @@ elif [ "$n_assessed" -lt "$n_changes" ];  then status=partial
 else                                            status=assessed
 fi
 coverage="${n_assessed}/${n_changes} PRs assessed"
-[ "$n_unknown" -gt 0 ] && coverage="${coverage}; ${n_unknown} need review"
+[ "$n_unknown" -gt 0 ] && coverage="${coverage} (${n_unknown} flagged needs-review)"
 
 if [ "$prev" = unknown ]; then
   backout="no previous release resolved (first release, or beyond the lookup window) — document a specific rollback"
@@ -270,8 +275,8 @@ environment: production
 ${changes_block}
 tested: "see this release's CI checks and post-deploy validation"
 backoutPlan: $(yamlstr "$backout")
-window: { start: "${published}" }
-correlationId: "${TAG}"
+window: { start: $(yamlstr "$published") }
+correlationId: $(yamlstr "$TAG")
 cmr: null
 \`\`\`
 EOF
