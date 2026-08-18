@@ -1,26 +1,35 @@
 #!/usr/bin/env bash
 # Append a Change Management attributes block to a published GitHub release.
 #
-# Fail-closed by design. On any hard failure — a GitHub lookup that errors, a malformed
-# .snow.yml, an invalid assessment value in a PR — the script logs to the run (stderr /
-# ::error::) and EXITS WITHOUT MODIFYING the release description. It never writes a
-# partial, invalid, or guessed record, and it never writes an error into the release
-# notes. Missing NON-critical data (e.g. the previous release used as the backout target,
-# or the publish time) is written as "unknown", not treated as a failure.
+# Two failure philosophies, on purpose:
+#   * CONFIG / INFRA errors — cannot read the release, no pull-requests:read scope, a
+#     missing or malformed .snow.yml, a transient/critical `gh` error — are FAIL-CLOSED:
+#     log ::error:: and EXIT WITHOUT MODIFYING the release. Never a partial/guessed record,
+#     never an error written into the release notes.
+#   * ASSESSMENT-CONTENT problems — a PR whose cm-assessment block is unparseable, has an
+#     invalid value, or is missing impact/risk/changeType, or a cmr:high-risk label that
+#     conflicts with the PR's own low self-assessment — do NOT abort. The release is still
+#     recorded, with `assessmentStatus: needs-review` so a human knows to look, rather than
+#     silently defaulting to low or blocking the whole release over one PR.
 #
-# Values (sourced from the merged PRs and the release):
-#   serviceIds    the repo's .snow.yml (required; absent or unparseable => abort).
-#   impact/risk   the aggregate (highest) across the release's PRs — each PR's own
-#                 cm-assessment block (written at PR time by the `cmr` skill) when present,
-#                 otherwise the §3.1.1 baseline (unnoticeable/minor). Unassessed PRs floor
-#                 at the baseline, so assessing a PR can only raise the rating, never lower
-#                 it. The cmr:high-risk label is an escalate-only floor.
+# assessmentStatus (the coverage signal a human scans for):
+#   assessed      every merged PR carried a valid cm-assessment  ("assessed low-risk" = this + low values)
+#   partial       some PRs assessed, the rest floored to the §3.1.1 baseline
+#   unassessed    no PR carried an assessment (heuristic baseline) — worth a look
+#   needs-review  a PR's assessment was unparseable/invalid, or a label/assessment conflict
+#
+# Values:
+#   serviceIds    the repo's .snow.yml (required; inline `[a, b]` or block list of integers).
+#   impact/risk   the aggregate (highest) across the PRs — each PR's cm-assessment block
+#                 (written at PR time by the `cmr` skill) when present, else the §3.1.1
+#                 baseline (unnoticeable/minor). Unassessed/unknown PRs floor at the
+#                 baseline, so assessing a PR can only raise the rating. The cmr:high-risk
+#                 label is an optional escalate-only floor (the block is the primary signal).
 #   changeType    max of the PRs' declared changeType and the severity-derived model.
-#   changes       one entry per merged PR: author, approving reviewer login(s) (each
-#                 reviewer's latest review, kept only if APPROVED), independentlyApproved
-#                 (a non-bot reviewer other than the author approved), and the PR's own
-#                 assessed impact/risk when present.
-#   assessedFrom / assessedCoverage  honest provenance (how many PRs carried an assessment).
+#   changes[]     per merged PR: author, approving reviewer login(s) (each reviewer's latest
+#                 review, kept only if APPROVED), independentlyApproved (a reviewer other
+#                 than the author approved — human OR AI agent, an ai-native org), the PR's
+#                 own impact/risk (or unknown when unparseable), and its backout if provided.
 #
 # Content in the repos is trusted; the script validates for syntax mistakes only. A human
 # can override the result: the script never overwrites an existing block, so editing the
@@ -37,6 +46,7 @@ set -euo pipefail
 log_err()  { echo "::error::release-cm: $*" >&2; }
 log_warn() { echo "::warning::release-cm: $*" >&2; }
 die()      { log_err "$*"; exit 1; }
+lc()       { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 errf=""; trap 'rm -f "${errf:-}"' EXIT
 
 # --- §3.1.1 severity helpers (rank <-> name; validation) ---
@@ -49,13 +59,12 @@ ctype_name()  { case "$1" in 2) echo emergency;; 1) echo normal;; *) echo standa
 valid_impact() { case "$1" in no-impact|unnoticeable|degradation|outage) return 0;; *) return 1;; esac; }
 valid_risk()   { case "$1" in minor|major) return 0;; *) return 1;; esac; }
 valid_ctype()  { case "$1" in standard|normal|emergency) return 0;; *) return 1;; esac; }
-is_bot()       { case "$1" in *"[bot]"|app/*) return 0;; *) return 1;; esac; }
 
 TAG="${1:?usage: release-cm.sh <tag>}"
 REPO="${REPO:-${GITHUB_REPOSITORY:?REPO or GITHUB_REPOSITORY required}}"
 SNOW_YML="${SNOW_YML:-.snow.yml}"
 
-# --- serviceIds from .snow.yml (required). Supports inline `[a, b]` and block-list forms.
+# --- serviceIds from .snow.yml (required; CONFIG error => fail closed). Inline + block forms.
 [ -f "$SNOW_YML" ] || die "no $SNOW_YML — repo is not onboarded for change management; refusing to write an unattributed record"
 service_ids=$(awk '
   found==0 && /^[[:space:]]*serviceIds:[[:space:]]*\[/ {
@@ -107,8 +116,8 @@ pr_nums=$(printf '%s\n' "$body" | grep -oE '#[0-9]+' | tr -d '#' | sort -un || t
 n_refs=$(printf '%s' "$pr_nums" | wc -w | tr -d ' ')
 [ "${n_refs:-0}" -gt 200 ] && log_warn "release references $n_refs PR/issue refs; processing all of them"
 
-changes=""; high_risk=""; n_changes=0; n_assessed=0
-agg_impact=-1; agg_risk=-1; agg_ctype=0   # -1 = no PR seen yet; per-PR baseline is applied below
+changes=""; high_risk=""; n_changes=0; n_assessed=0; n_unknown=0; needs_review=""
+agg_impact=-1; agg_risk=-1; agg_ctype=0   # -1 = no PR seen yet; per-PR baseline applied below
 for n in $pr_nums; do
   errf=$(mktemp)
   if ! pr_json=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews,body 2>"$errf"); then
@@ -126,6 +135,8 @@ for n in $pr_nums; do
   [ "$(printf '%s' "$pr_json" | jq -r '(([.labels[].name]|index("cmr:high-risk"))!=null)')" = "true" ] && high_risk=1
 
   # Approving reviewers: each reviewer's LATEST review, kept only if its state is APPROVED.
+  # independentlyApproved = a reviewer other than the author approved — human OR AI agent
+  # (an ai-native org treats an agent's independent review as valid segregation of duties).
   approvers=$(printf '%s' "$pr_json" | jq -r \
     '[.reviews[]|select(.author.login!=null)]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="APPROVED"))|.[].author.login' \
     2>/dev/null || true)
@@ -135,50 +146,63 @@ for n in $pr_nums; do
     while IFS= read -r rev; do
       [ -n "$rev" ] || continue
       arr="${arr:+$arr, }\"${rev}\""
-      if [ "$rev" != "$a" ] && ! is_bot "$rev"; then independent=true; fi
+      [ "$rev" != "$a" ] && independent=true
     done <<<"$approvers"
     approved_arr="[${arr}]"
   fi
 
-  # PR cm-assessment block (the LAST one wins). Validate any present value; a syntax
-  # mistake (invalid enum) is a hard failure — abort, do not record a wrong rating.
+  # PR cm-assessment block (the LAST one wins). Assessment-content problems mark the PR
+  # `unknown` and set needs-review — they do NOT abort or silently default to low.
   pr_body=$(printf '%s' "$pr_json" | jq -r '.body // ""')
-  pr_impact=""; pr_risk=""; pr_ctype=""
+  pr_impact=""; pr_risk=""; pr_ctype=""; pr_backout=""; pr_unknown=""
   if printf '%s\n' "$pr_body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$'; then
-    # Take the LAST complete (fenced) block. A marker with no closing fence yields nothing.
     blk=$(printf '%s\n' "$pr_body" | awk '
       /^[[:space:]]*cm-assessment: v1[[:space:]]*$/ { cap=1; buf=$0 ORS; next }
       cap && /^[[:space:]]*```/ { last=buf; cap=0; next }
       cap { buf=buf $0 ORS }
       END { printf "%s", last }')
-    [ -n "$blk" ] || die "PR #$n has a cm-assessment marker but the block is not properly fenced (release left unmodified)"
-    # Values are case-insensitive; extract the raw token then lowercase and validate.
-    lc() { printf '%s' "$1" | tr "[:upper:]" "[:lower:]"; }
-    pr_impact=$(lc "$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*impact:[[:space:]]*([^[:space:]#]+).*/\1/p'     | head -1)")
-    pr_risk=$(lc "$(printf   '%s' "$blk" | sed -nE 's/^[[:space:]]*risk:[[:space:]]*([^[:space:]#]+).*/\1/p'       | head -1)")
-    pr_ctype=$(lc "$(printf  '%s' "$blk" | sed -nE 's/^[[:space:]]*changeType:[[:space:]]*([^[:space:]#]+).*/\1/p' | head -1)")
-    [ -z "$pr_impact" ] || valid_impact "$pr_impact" || die "PR #$n cm-assessment: invalid impact '${pr_impact}' (expected no-impact|unnoticeable|degradation|outage)"
-    [ -z "$pr_risk" ]   || valid_risk   "$pr_risk"   || die "PR #$n cm-assessment: invalid risk '${pr_risk}' (expected minor|major)"
-    [ -z "$pr_ctype" ]  || valid_ctype  "$pr_ctype"  || die "PR #$n cm-assessment: invalid changeType '${pr_ctype}' (expected standard|normal|emergency)"
-    [ -n "${pr_impact}${pr_risk}${pr_ctype}" ] \
-      || die "PR #$n has a cm-assessment block with none of impact/risk/changeType (release left unmodified)"
-    n_assessed=$((n_assessed + 1))
+    if [ -z "$blk" ]; then
+      pr_unknown=1; log_warn "PR #$n: cm-assessment marker with no closed fenced block — marked needs-review"
+    else
+      pr_impact=$(lc "$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*impact:[[:space:]]*([^[:space:]#]+).*/\1/p'     | head -1)")
+      pr_risk=$(lc "$(printf   '%s' "$blk" | sed -nE 's/^[[:space:]]*risk:[[:space:]]*([^[:space:]#]+).*/\1/p'       | head -1)")
+      pr_ctype=$(lc "$(printf  '%s' "$blk" | sed -nE 's/^[[:space:]]*changeType:[[:space:]]*([^[:space:]#]+).*/\1/p' | head -1)")
+      pr_backout=$(printf '%s' "$blk" | sed -nE 's/^[[:space:]]*backout:[[:space:]]*(.+)$/\1/p' | head -1)
+      pr_backout=${pr_backout%\"}; pr_backout=${pr_backout#\"}
+      if [ -n "$pr_impact" ] && ! valid_impact "$pr_impact"; then pr_unknown=1; log_warn "PR #$n: invalid impact '${pr_impact}' — marked needs-review"; pr_impact=""; fi
+      if [ -n "$pr_risk" ]   && ! valid_risk   "$pr_risk";   then pr_unknown=1; log_warn "PR #$n: invalid risk '${pr_risk}' — marked needs-review";   pr_risk=""; fi
+      if [ -n "$pr_ctype" ]  && ! valid_ctype  "$pr_ctype";  then pr_unknown=1; log_warn "PR #$n: invalid changeType '${pr_ctype}' — marked needs-review"; pr_ctype=""; fi
+      if [ -z "${pr_impact}${pr_risk}${pr_ctype}" ] && [ -z "$pr_unknown" ]; then
+        pr_unknown=1; log_warn "PR #$n: cm-assessment has none of impact/risk/changeType — marked needs-review"
+      fi
+      [ -z "$pr_unknown" ] && [ -n "${pr_impact}${pr_risk}${pr_ctype}" ] && n_assessed=$((n_assessed + 1))
+    fi
+    if [ -n "$pr_unknown" ]; then n_unknown=$((n_unknown + 1)); needs_review=1; fi
   fi
 
-  # Aggregate = max. Unassessed PRs use the §3.1.1 baseline so they never lower the rating.
+  # Aggregate = max. Unassessed/unknown PRs use the baseline so they never lower the rating.
   ir=$(impact_rank "${pr_impact:-unnoticeable}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
   rr=$(risk_rank "${pr_risk:-minor}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
   if [ -n "$pr_ctype" ]; then cr=$(ctype_rank "$pr_ctype"); [ "$cr" -gt "$agg_ctype" ] && agg_ctype=$cr; fi
 
-  assessed=""
-  [ -n "$pr_impact" ] && assessed="${assessed}
+  extra=""
+  if [ -n "$pr_unknown" ]; then
+    extra="${extra}
+    impact: unknown
+    risk: unknown
+    note: \"cm-assessment present but unparseable/invalid — needs review\""
+  else
+    [ -n "$pr_impact" ] && extra="${extra}
     impact: ${pr_impact}"
-  [ -n "$pr_risk" ] && assessed="${assessed}
+    [ -n "$pr_risk" ] && extra="${extra}
     risk: ${pr_risk}"
+  fi
+  [ -n "$pr_backout" ] && extra="${extra}
+    backout: \"${pr_backout}\""
   changes="${changes}  - pr: ${n}
     author: \"${a}\"
     approvedBy: ${approved_arr}
-    independentlyApproved: ${independent}${assessed}
+    independentlyApproved: ${independent}${extra}
 "
 done
 changes="${changes%$'\n'}"
@@ -189,20 +213,31 @@ ${changes}"; fi
 # No PR seen at all: fall back to the §3.1.1 baseline (unnoticeable / minor).
 [ "$agg_impact" -lt 0 ] && agg_impact=1
 [ "$agg_risk" -lt 0 ]   && agg_risk=0
+pre_impact=$agg_impact; pre_risk=$agg_risk
 
-# --- Resolve impact/risk, apply the escalate-only label floor, derive the change model.
+# --- Escalate-only label floor (optional signal), then the controversy check.
+if [ -n "$high_risk" ]; then
+  [ "$agg_impact" -lt 2 ] && agg_impact=2
+  [ "$agg_risk" -lt 1 ]   && agg_risk=1
+  # cmr:high-risk label but the PRs' own assessments said low => conflicting signal.
+  [ "$n_assessed" -gt 0 ] && [ "$pre_impact" -lt 2 ] && [ "$pre_risk" -lt 1 ] && needs_review=1
+fi
 impact=$(impact_name "$agg_impact")
 risk=$(risk_name "$agg_risk")
-if [ -n "$high_risk" ]; then
-  [ "$(impact_rank "$impact")" -lt 2 ] && { impact=degradation; agg_impact=2; }
-  [ "$(risk_rank "$risk")" -lt 1 ]     && { risk=major;         agg_risk=1; }
-fi
-sev_ct=0; { [ "$risk" = major ] || [ "$(impact_rank "$impact")" -ge 2 ]; } && sev_ct=1
+sev_ct=0; { [ "$agg_risk" -ge 1 ] || [ "$agg_impact" -ge 2 ]; } && sev_ct=1
 [ "$sev_ct" -gt "$agg_ctype" ] && agg_ctype=$sev_ct
 change_type=$(ctype_name "$agg_ctype")
 
-if [ "$n_assessed" -gt 0 ]; then assessed_from=pr-cm-assessment; else assessed_from=heuristic; fi
+# --- assessmentStatus: the coverage/confidence signal a human scans for.
+if   [ -n "$needs_review" ];              then status=needs-review
+elif [ "$n_changes" -eq 0 ];              then status=unassessed
+elif [ "$n_assessed" -eq 0 ];             then status=unassessed
+elif [ "$n_assessed" -lt "$n_changes" ];  then status=partial
+else                                            status=assessed
+fi
 coverage="${n_assessed}/${n_changes} PRs assessed"
+[ "$n_unknown" -gt 0 ] && coverage="${coverage}; ${n_unknown} need review"
+
 if [ "$prev" = unknown ]; then
   backout="no previous release resolved (first release, or beyond the lookup window) — document a specific rollback"
 else
@@ -219,7 +254,7 @@ serviceIds: [${ids_fmt}]
 changeType: ${change_type}      # standard | normal | emergency
 impact: ${impact}               # §3.1.1: no-impact | unnoticeable | degradation | outage
 risk: ${risk}                   # §3.1.1: minor | major
-assessedFrom: ${assessed_from}  # pr-cm-assessment | heuristic
+assessmentStatus: ${status}     # assessed | partial | unassessed | needs-review (a human should check needs-review)
 assessedCoverage: "${coverage}"
 environment: production
 ${changes_block}
@@ -240,4 +275,4 @@ fi
 
 gh release edit "$TAG" -R "$REPO" --notes "${body}${block}" \
   || die "failed to update release $TAG (release left unmodified)"
-echo "decorated ${REPO} release ${TAG} (impact=${impact} risk=${risk} changeType=${change_type} assessed=${coverage})"
+echo "decorated ${REPO} release ${TAG} (impact=${impact} risk=${risk} changeType=${change_type} status=${status} coverage='${coverage}')"
