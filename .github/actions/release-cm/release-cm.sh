@@ -5,8 +5,8 @@
 #   serviceIds   the repo's .snow.yml
 #   impact/risk  Change Management Standard §3.1.1 — default unnoticeable/minor,
 #                escalated to degradation/major if any merged PR carries cmr:high-risk
-#   author       the actual author login(s) of the merged PR(s)
-#   approvedBy   the actual approving reviewer login(s) of the merged PR(s)
+#   changes      one entry per merged PR: author, approving reviewer login(s), and
+#                independentlyApproved (an approver other than the author — SoD)
 #   backoutPlan  redeploy the previous release
 # The release notes above the block are the change description (not duplicated here).
 # Idempotent. Decoration only — no ServiceNow API calls.
@@ -43,20 +43,36 @@ prev=$(gh release list -R "$REPO" -L 100 --json tagName -q '.[].tagName' \
 # Merged PRs referenced in the release notes (semantic-release links them as #NNN).
 # One reliable call per PR: real author, approving reviewers, and the cmr:high-risk label.
 pr_nums=$(printf '%s' "$body" | grep -oE '#[0-9]+' | tr -d '#' | sort -un | head -30)
-prs=""; authors=""; approvers=""; high_risk=""
+changes=""; high_risk=""; n_changes=0
 for n in $pr_nums; do
-  # Skip numbers that are not PRs (issue refs); tab-separated: author \t highRisk \t approvers(|-joined)
+  # tab-separated: author \t highRisk \t approvers(|-joined). Non-PR refs (issues) fail → skipped.
   line=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews --jq \
     '[.author.login, ((([.labels[].name]|index("cmr:high-risk"))!=null)|tostring), ([.reviews[]|select(.state=="APPROVED")|.author.login]|unique|join("|"))] | @tsv' \
     2>/dev/null) || continue
   IFS=$'\t' read -r a hr ap <<<"$line"
-  prs="${prs:+$prs, }$n"
-  [ -n "$a" ] && authors="${authors}${a}"$'\n'
+  [ -n "$a" ] || continue
+  n_changes=$((n_changes + 1))
   [ "$hr" = "true" ] && high_risk=1
-  [ -n "$ap" ] && approvers="${approvers}$(printf '%s' "$ap" | tr '|' '\n')"$'\n'
+  # Approving reviewers → quoted YAML inline array; SoD = at least one approver other than the author.
+  approved_arr="[]"; independent=false
+  if [ -n "$ap" ]; then
+    arr=""
+    while IFS= read -r rev; do
+      [ -n "$rev" ] || continue
+      arr="${arr:+$arr, }\"${rev}\""
+      [ "$rev" != "$a" ] && independent=true
+    done <<<"$(printf '%s' "$ap" | tr '|' '\n')"
+    approved_arr="[${arr}]"
+  fi
+  changes="${changes}  - pr: ${n}
+    author: \"${a}\"
+    approvedBy: ${approved_arr}
+    independentlyApproved: ${independent}
+"
 done
-authors=$(printf '%s' "$authors" | grep -v '^$' | sort -u | paste -sd, - || true)
-approvers=$(printf '%s' "$approvers" | grep -v '^$' | sort -u | paste -sd, - || true)
+changes="${changes%$'\n'}"   # drop the trailing newline
+if [ "$n_changes" -eq 0 ]; then changes_block="changes: []"; else changes_block="changes:                     # one entry per merged PR — per-change approval evidence (SoD)
+${changes}"; fi
 
 # Auto-classified change model / impact / risk (Change Management Standard §3.1.1).
 change_type=standard; risk=minor; impact=unnoticeable
@@ -73,9 +89,7 @@ changeType: ${change_type}      # auto-classified from the merged PRs' cmr:high-
 impact: ${impact}               # §3.1.1: no-impact | unnoticeable | degradation | outage
 risk: ${risk}                   # §3.1.1: minor | major
 environment: production
-prs: [${prs}]
-author: "${authors:-unknown}"
-approvedBy: "${approvers:-none}"   # actual approving reviewer(s) on the merged PR(s)
+${changes_block}
 tested: "CI + post-deploy validation gate the release"
 backoutPlan: "redeploy the previous release ${prev:-unknown}"
 window: { start: "${published:-unknown}" }
@@ -92,4 +106,4 @@ if [ -n "${DRY_RUN:-}" ]; then
 fi
 
 gh release edit "$TAG" -R "$REPO" --notes "${body}${block}"
-echo "decorated ${REPO} release ${TAG} (impact=${impact} risk=${risk} author=${authors:-unknown} approvedBy=${approvers:-none})"
+echo "decorated ${REPO} release ${TAG} (impact=${impact} risk=${risk} changes=${n_changes})"
