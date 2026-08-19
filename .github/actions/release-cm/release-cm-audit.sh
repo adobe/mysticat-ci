@@ -30,17 +30,58 @@ releases=$(gh release list -R "$REPO" -L 1000 --json tagName,publishedAt,isDraft
       | sort_by(.publishedAt) | .[] | "\(.tagName)\t\(.publishedAt)"') \
   || { echo "::error::cannot list releases for $REPO (check GH_TOKEN / repo access)" >&2; exit 1; }
 
-# Optional artifact persistence for review / sharing with stakeholders (OUT_DIR=<dir>):
-# a manifest.md status table + per-release .cm.yaml block files.
-OUT_DIR="${OUT_DIR:-}"
-if [ -n "$OUT_DIR" ]; then
-  mkdir -p "$OUT_DIR"
-  MANIFEST="$OUT_DIR/manifest.md"
-  { printf '# release-cm-audit — %s — since %s — mode %s\n\n' "$REPO" "$SINCE" "$MODE"
-    printf '| release | date | status |\n|---|---|---|\n'; } > "$MANIFEST"
+# Optional artifact persistence (RUN=<dir>; OUT_DIR accepted as a legacy alias). The audit
+# COLLECTS facts into the SAME nested layout cmr-report.sh renders, so the whole toolchain
+# shares one scheme: <RUN>/<owner>__<repo>/{repo.yaml, <tag-safe>/release.yaml, <tag-safe>/pr-<n>.yaml}.
+# Render the navigable md tree afterwards with:  cmr-report.sh <RUN> --mode <mode> --since <since>
+RUN="${RUN:-${OUT_DIR:-}}"
+owner_repo=${REPO/\//__}
+repodir="$RUN/$owner_repo"
+if [ -n "$RUN" ]; then
+  mkdir -p "$repodir"
+  [ -f "$repodir/repo.yaml" ] || printf 'repo: %s\nhost: %s\n' "$REPO" "${GH_HOST:-github.com}" > "$repodir/repo.yaml"
 fi
-mrow()      { [ -n "$OUT_DIR" ] || return 0; printf '| %s | %s | %s |\n' "$1" "$2" "$3" >> "$MANIFEST"; }
-writeblock(){ [ -n "$OUT_DIR" ] || return 0; printf '%s\n' "$2" | awk '/```yaml/{f=1;next} f&&/^```/{exit} f{print}' > "$OUT_DIR/$1.cm.yaml"; }
+tagsafe(){ printf '%s' "$1" | sed 's#[^A-Za-z0-9._-]#_#g'; }   # enforce a flat, path-safe folder name
+
+# Minimal release.yaml (report mode + fallbacks): tag + a coverage/status label.
+write_status(){
+  [ -n "$RUN" ] || return 0
+  local d; d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"
+  printf 'tag: %s\nassessmentStatus: %s\n' "$1" "$2" > "$d/release.yaml"
+}
+
+# release.yaml (+ per-PR pr-<n>.yaml) parsed from a release-cm DRY block ($2 = its full output).
+# A pr-<n>.yaml the agent already authored (richer: rationale/title) is kept, not overwritten.
+write_release(){
+  [ -n "$RUN" ] || return 0
+  local d blk ct im rk st cov
+  d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"
+  blk=$(printf '%s\n' "$2" | awk '/```yaml/{f=1;next} f&&/^```/{exit} f{print}')
+  ct=$(printf  '%s\n' "$blk" | sed -nE 's/^changeType:[[:space:]]*([a-z]+).*/\1/p'  | head -1)
+  im=$(printf  '%s\n' "$blk" | sed -nE 's/^impact:[[:space:]]*([a-z-]+).*/\1/p'      | head -1)
+  rk=$(printf  '%s\n' "$blk" | sed -nE 's/^risk:[[:space:]]*([a-z]+).*/\1/p'         | head -1)
+  st=$(printf  '%s\n' "$blk" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1)
+  cov=$({ printf '%s\n' "$blk" | grep -E '^assessedCoverage:' || true; } | head -1 | sed -E 's/^assessedCoverage:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//')
+  { printf 'tag: %s\n' "$1"
+    [ -n "$ct" ]  && printf 'changeType: %s\n' "$ct"
+    [ -n "$im" ]  && printf 'impact: %s\n' "$im"
+    [ -n "$rk" ]  && printf 'risk: %s\n' "$rk"
+    printf 'assessmentStatus: %s\n' "${st:-unassessed}"
+    [ -n "$cov" ] && printf 'coverage: "%s"\n' "$cov"
+  } > "$d/release.yaml"
+  # per-PR rows come from the changes: list (impact/risk only; the agent enriches later)
+  { printf '%s\n' "$blk" | awk '
+      /^changes:/{inc=1;next} !inc{next}
+      /^[[:space:]]*-[[:space:]]*pr:[[:space:]]*[0-9]+/ { if(pr!="")print pr"\t"im"\t"rk; pr=$0; sub(/.*pr:[[:space:]]*/,"",pr); sub(/[^0-9].*/,"",pr); im=""; rk=""; next }
+      /^[[:space:]]*impact:/ { s=$0; sub(/^[[:space:]]*impact:[[:space:]]*/,"",s); sub(/[[:space:]#].*$/,"",s); im=s; next }
+      /^[[:space:]]*risk:/   { s=$0; sub(/^[[:space:]]*risk:[[:space:]]*/,"",s);   sub(/[[:space:]#].*$/,"",s); rk=s; next }
+      END{ if(pr!="")print pr"\t"im"\t"rk }' ; } | while IFS=$'\t' read -r pn pim prk; do
+    [ -n "$pn" ] || continue
+    f="$d/pr-$pn.yaml"
+    [ -f "$f" ] && continue
+    { printf 'pr: %s\n' "$pn"; [ -n "$pim" ] && printf 'impact: %s\n' "$pim"; [ -n "$prk" ] && printf 'risk: %s\n' "$prk"; } > "$f"
+  done
+}
 
 total=0; covered=0; gap=0; suggested=0; needsreview=0; fixed=0; failed=0
 echo "== release-cm-audit  repo=$REPO  since=$SINCE  mode=$MODE =="
@@ -51,12 +92,12 @@ while IFS=$'\t' read -r tag published; do
   day=${published%%T*}
   body=$(gh release view "$tag" -R "$REPO" --json body -q .body 2>/dev/null || true)
   if printf '%s\n' "$body" | grep -qE "$MARKER"; then
-    covered=$((covered + 1)); mrow "$tag" "$day" "covered"; continue
+    covered=$((covered + 1)); write_status "$tag" covered; continue
   fi
   gap=$((gap + 1))
   case "$MODE" in
     report)
-      echo "GAP      $tag  $day  — no CM block"; mrow "$tag" "$day" "GAP — no CM block"
+      echo "GAP      $tag  $day  — no CM block"; write_status "$tag" gap
       ;;
     suggest)
       if out=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
@@ -64,10 +105,10 @@ while IFS=$'\t' read -r tag published; do
         echo "SUGGEST  $tag  $day  assessmentStatus=${st:-?}"
         printf '%s\n' "$out" | awk '/```yaml/{f=1;print "    "$0;next} f&&/^```/{print "    "$0;exit} f{print "    "$0}'
         suggested=$((suggested + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
-        mrow "$tag" "$day" "suggested (${st:-?})"; writeblock "$tag" "$out"
+        write_release "$tag" "$out"
       else
         echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
-        failed=$((failed + 1)); mrow "$tag" "$day" "FAILED"
+        failed=$((failed + 1)); write_status "$tag" failed
       fi
       ;;
     fix)
@@ -75,10 +116,11 @@ while IFS=$'\t' read -r tag published; do
         st=$(printf '%s\n' "$out" | sed -nE 's/.*status=([a-z-]+).*/\1/p' | head -1)
         echo "FIXED    $tag  $day  ${st:+assessmentStatus=$st}"
         fixed=$((fixed + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
-        mrow "$tag" "$day" "fixed (${st:-?})"
+        # capture the block via a DRY pass so the shared data files reflect what was written
+        dry=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1) && write_release "$tag" "$dry" || write_status "$tag" "${st:-fixed}"
       else
         echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
-        failed=$((failed + 1)); mrow "$tag" "$day" "FAILED"
+        failed=$((failed + 1)); write_status "$tag" failed
       fi
       ;;
   esac
@@ -89,7 +131,7 @@ case "$MODE" in
   suggest) echo "-- suggested ${suggested} (of which ${needsreview} need review), ${failed} could not be generated --";;
   fix)     echo "-- fixed ${fixed} (of which ${needsreview} need review), ${failed} could not be generated --";;
 esac
-[ -n "$OUT_DIR" ] && echo "-- artifacts written to ${OUT_DIR} --"
+[ -n "$RUN" ] && echo "-- data written to ${repodir}/ — render the tree with: cmr-report.sh ${RUN} --mode ${MODE} --since ${SINCE} --"
 # fix mode signals a non-zero exit if any release could not be backfilled, so CI shows red.
 [ "$MODE" = fix ] && [ "$failed" -gt 0 ] && exit 1
 exit 0

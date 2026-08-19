@@ -82,13 +82,27 @@ SNOW="$TMP/nope.yml" runa 2026-01-01 fix
 runa 2026-1-1 report; { [ "$RC" -eq 2 ]; } && ok "rejects malformed date" || no "date-validation" "$OUT (rc=$RC)"
 runa 2026-01-01 bogus; { [ "$RC" -eq 2 ]; } && ok "rejects bad mode" || no "mode-validation" "$OUT (rc=$RC)"
 
-# ---- OUT_DIR artifact persistence (manifest + per-release block) ----
-AOUT="$TMP/artifacts"
-OUT=$( SNOW_YML="$TMP/snow.yml" REPO=x/y OUT_DIR="$AOUT" bash "$AUDIT" 2026-01-01 suggest 2>&1 ); RC=$?
-{ [ -f "$AOUT/manifest.md" ] && grep -q '| v1.1.0 |' "$AOUT/manifest.md" && [ -f "$AOUT/v1.1.0.cm.yaml" ] \
-  && { ! command -v ruby >/dev/null 2>&1 || ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' "$AOUT/v1.1.0.cm.yaml" >/dev/null 2>&1; } \
-  && has 'artifacts written to' && [ "$RC" -eq 0 ]; } \
-  && ok "OUT_DIR persists manifest + valid per-release block" || no "OUT_DIR artifacts" "$OUT"
+# ---- RUN persists the shared NESTED layout that cmr-report.sh consumes ----
+AOUT="$TMP/run"
+OUT=$( SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$AOUT" bash "$AUDIT" 2026-01-01 suggest 2>&1 ); RC=$?
+RELY="$AOUT/x__y/v1.1.0/release.yaml"
+{ [ -f "$AOUT/x__y/repo.yaml" ] && grep -q '^repo: x/y' "$AOUT/x__y/repo.yaml" \
+  && [ -f "$RELY" ] && grep -q '^tag: v1.1.0' "$RELY" && grep -q '^impact: degradation' "$RELY" \
+  && [ -f "$AOUT/x__y/v1.1.0/pr-10.yaml" ] && grep -q '^pr: 10' "$AOUT/x__y/v1.1.0/pr-10.yaml" \
+  && { ! command -v ruby >/dev/null 2>&1 || ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' "$RELY" >/dev/null 2>&1; } \
+  && has 'render the tree with' && [ "$RC" -eq 0 ]; } \
+  && ok "RUN persists nested repo/release/pr data" || no "RUN nested artifacts" "$OUT"
+
+# ---- the audit's data renders cleanly through cmr-report.sh (one shared scheme) ----
+REPORT="$HERE/cmr-report.sh"
+if [ -f "$REPORT" ]; then
+  bash "$REPORT" "$AOUT" --mode suggest --since 2026-01-01 >/dev/null 2>&1
+  { [ -f "$AOUT/README.md" ] && [ -f "$AOUT/x__y/repo.md" ] && [ -f "$AOUT/x__y/v1.1.0/release.md" ] \
+    && grep -q '/pull/10' "$AOUT/x__y/v1.1.0/release.md"; } \
+    && ok "audit data renders through cmr-report" || no "audit->cmr-report" "$(cat "$AOUT/README.md" 2>/dev/null)"
+else
+  no "audit->cmr-report" "cmr-report.sh not found next to audit script"
+fi
 
 echo
 echo "-------- $pass passed, $fail failed --------"

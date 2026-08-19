@@ -17,7 +17,8 @@
 #   assessed      every merged PR carried a valid cm-assessment  ("assessed low-risk" = this + low values)
 #   partial       some PRs assessed, the rest floored to the §3.1.1 baseline
 #   unassessed    no PR carried an assessment (heuristic baseline) — worth a look
-#   needs-review  a PR's assessment was unparseable/invalid/incomplete, or a label/assessment conflict
+#   needs-review  a PR's assessment was unparseable/invalid/incomplete, a label/assessment
+#                 conflict, or the PR carried MULTIPLE cm-assessment blocks that disagree
 #
 # Values:
 #   serviceIds    the repo's .snow.yml (required; inline `[a, b]` or block list of integers).
@@ -37,7 +38,8 @@
 # Content in the repos is trusted; the script validates for syntax mistakes only. A human
 # can override the result: the script never overwrites an existing block, so editing the
 # Change Management block in the release notes (or the PR's cm-assessment block before the
-# release is cut) is preserved.
+# release is cut) is preserved. To override a PR's assessment, EDIT its block in place —
+# appending a second, disagreeing block does not silently win; it resolves to needs-review.
 #
 # Idempotent. Decoration only — no ServiceNow API calls.
 #
@@ -161,12 +163,27 @@ for n in $pr_nums; do
     approved_arr="[${arr}]"
   fi
 
-  # PR cm-assessment block (the LAST one wins). Per-field: a present-but-invalid value is
-  # shown as `unknown` and flags needs-review; a structurally broken block flags the PR.
+  # PR cm-assessment block. A single block (or several that AGREE on the gating fields) is used;
+  # per-field, a present-but-invalid value is shown as `unknown` and flags needs-review, and a
+  # structurally broken block flags the PR. MULTIPLE blocks that DISAGREE resolve to unknown /
+  # needs-review — a human must reduce them to one authoritative block (that is how override works).
   pr_body=$(printf '%s' "$pr_json" | jq -r '.body // ""')
   pr_impact=""; pr_risk=""; pr_ctype=""; pr_backout=""
-  impact_bad=""; risk_bad=""; flag=""; unparsed=""
+  impact_bad=""; risk_bad=""; flag=""; unparsed=""; conflict=""
   if printf '%s\n' "$pr_body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$'; then
+    # Signature (impact|risk|changeType) of every CLOSED block; >1 distinct == conflicting blocks.
+    sigs=$(printf '%s\n' "$pr_body" | awk '
+      /^[[:space:]]*cm-assessment: v1[[:space:]]*$/ { cap=1; im=""; rk=""; ct=""; next }
+      cap && /^[[:space:]]*```/ { printf "%s|%s|%s\n", tolower(im), tolower(rk), tolower(ct); cap=0; next }
+      cap && /^[[:space:]]*impact:/     { if (im=="") { s=$0; sub(/^[[:space:]]*impact:[[:space:]]*/,"",s);     sub(/[[:space:]#].*$/,"",s); im=s } }
+      cap && /^[[:space:]]*risk:/       { if (rk=="") { s=$0; sub(/^[[:space:]]*risk:[[:space:]]*/,"",s);       sub(/[[:space:]#].*$/,"",s); rk=s } }
+      cap && /^[[:space:]]*changeType:/ { if (ct=="") { s=$0; sub(/^[[:space:]]*changeType:[[:space:]]*/,"",s); sub(/[[:space:]#].*$/,"",s); ct=s } }')
+    ndistinct=$({ printf '%s\n' "$sigs" | grep . || true; } | sort -u | wc -l | tr -d ' ')
+    if [ "${ndistinct:-0}" -gt 1 ]; then
+      conflict=1; unparsed=1; flag=1
+      log_warn "PR #$n: multiple conflicting cm-assessment blocks — needs-review (leave exactly one authoritative block)"
+      blk=""
+    else
     blk=$(printf '%s\n' "$pr_body" | awk '
       /^[[:space:]]*cm-assessment: v1[[:space:]]*$/ { cap=1; buf=$0 ORS; next }
       cap && /^[[:space:]]*```/ { last=buf; cap=0; next }
@@ -195,6 +212,7 @@ for n in $pr_nums; do
       fi
       [ -n "${pr_impact}${pr_risk}${pr_ctype}" ] && n_assessed=$((n_assessed + 1))
     fi
+    fi
     [ -n "$flag" ] && { n_unknown=$((n_unknown + 1)); needs_review=1; }
   fi
 
@@ -216,8 +234,11 @@ for n in $pr_nums; do
     impact: ${di}"
   [ -n "$dr" ] && extra="${extra}
     risk: ${dr}"
-  [ -n "$flag" ] && extra="${extra}
+  if [ -n "$conflict" ]; then extra="${extra}
+    note: \"multiple conflicting cm-assessment blocks — needs review\""
+  elif [ -n "$flag" ]; then extra="${extra}
     note: \"cm-assessment unparseable/invalid — needs review\""
+  fi
   [ -n "$pr_backout" ] && extra="${extra}
     backout: $(yamlstr "$pr_backout")"
   changes="${changes}  - pr: ${n}

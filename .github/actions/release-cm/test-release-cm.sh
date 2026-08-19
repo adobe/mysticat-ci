@@ -104,14 +104,25 @@ run T6 v2
 { has 'assessmentStatus: needs-review' && has 'impact: degradation' && has 'risk: major' && [ "$RC" -eq 0 ]; } \
   && ok "T6 label/assessment conflict" || no "T6 label/assessment conflict" "$OUT"
 
-# ---------- T7 duplicate block, last wins ----------
+# ---------- T7 conflicting blocks -> needs-review (a human must reduce to one) ----------
 mkfix T7; printf 'fixes #701\n' > "$FIXROOT/T7/release-body.txt"; echo null > "$FIXROOT/T7/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T7/releases.txt"
 mkpr T7 701 alice "$(blk 'impact: unnoticeable
 risk: minor')
 $(blk 'impact: degradation
 risk: major')" "$NOREV" "$NOLBL"
 run T7 v2
-{ has 'impact: degradation' && has 'assessmentStatus: assessed' && [ "$RC" -eq 0 ]; } && ok "T7 duplicate last-wins" || no "T7 duplicate last-wins" "$OUT"
+{ has 'assessmentStatus: needs-review' && has 'impact: unknown' && has 'conflicting cm-assessment blocks' && [ "$RC" -eq 0 ]; } \
+  && ok "T7 conflicting blocks -> needs-review" || no "T7 conflicting blocks -> needs-review" "$OUT"
+
+# ---------- T7b IDENTICAL duplicate blocks (no disagreement) -> still assessed ----------
+mkfix T7b; printf 'fixes #702\n' > "$FIXROOT/T7b/release-body.txt"; echo null > "$FIXROOT/T7b/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T7b/releases.txt"
+mkpr T7b 702 alice "$(blk 'impact: degradation
+risk: major')
+$(blk 'impact: degradation
+risk: major')" "$NOREV" "$NOLBL"
+run T7b v2
+{ has 'impact: degradation' && has 'assessmentStatus: assessed' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T7b identical duplicate blocks -> assessed" || no "T7b identical duplicate blocks -> assessed" "$OUT"
 
 # ---------- T8 AI-agent approves bot PR -> independent true ----------
 mkfix T8; printf 'fixes #801\n' > "$FIXROOT/T8/release-body.txt"; echo null > "$FIXROOT/T8/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T8/releases.txt"
