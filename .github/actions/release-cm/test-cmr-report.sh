@@ -25,9 +25,9 @@ printf 'pr: 42\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nrationa
 
 OUT=$(bash "$SCRIPT" "$R" --mode suggest --since 2026-08-17 --title "CM audit — test" 2>&1); RC=$?
 
-# T1 runs clean and reports scope
-{ [ "$RC" -eq 0 ] && case "$OUT" in *"2 repos"*|*"2 repos, 3 releases, 4 PRs"*) true;; *) false;; esac; } \
-  && ok "T1 exits 0 and reports scope" || no "T1" "$OUT (rc=$RC)"
+# T1 runs clean and reports the exact scope (all three counters, not just repos)
+{ [ "$RC" -eq 0 ] && case "$OUT" in *"2 repos, 3 releases, 4 PRs"*) true;; *) false;; esac; } \
+  && ok "T1 exits 0 and reports exact scope" || no "T1" "$OUT (rc=$RC)"
 
 # T2 full tree exists
 { [ -f "$R/README.md" ] \
@@ -72,6 +72,62 @@ corp="$R/adobe-rnd__llmo-data-retrieval-service/release-2026-08-18/pr-42.md"
 OUT=$(bash "$SCRIPT" "$TMP/nope" 2>&1); RC=$?
 { [ "$RC" -eq 1 ] && case "$OUT" in *"no such run dir"*) true;; *) false;; esac; } \
   && ok "T8 missing run dir errors" || no "T8" "$OUT (rc=$RC)"
+
+# T9 yget: keep a value that merely ends in a quote; strip an inline `# comment` on an enum
+R9="$TMP/r9"; mkdir -p "$R9/o__r/v1"
+printf 'repo: o/r\n' > "$R9/o__r/repo.yaml"
+printf 'tag: v1\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nassessmentStatus: assessed\ncoverage: "1/1"\n' > "$R9/o__r/v1/release.yaml"
+printf 'pr: 9\ntitle: rename flag to "v2"\nchangeType: standard   # standard | normal\nimpact: unnoticeable\nrisk: minor\nrationale: "ok"\n' > "$R9/o__r/v1/pr-9.yaml"
+bash "$SCRIPT" "$R9" >/dev/null 2>&1
+pr9="$R9/o__r/v1/pr-9.md"
+{ grep -qF '> rename flag to "v2"' "$pr9" && grep -qF '| standard | unnoticeable | minor |' "$pr9"; } \
+  && ok "T9 balanced-quote + inline-comment parsing" || no "T9" "$(cat "$pr9")"
+
+# T10 PR link/URL come from the filename, not the internal pr: field (mismatch -> filename wins)
+R10="$TMP/r10"; mkdir -p "$R10/o__r/v1"
+printf 'repo: o/r\n' > "$R10/o__r/repo.yaml"
+printf 'tag: v1\nassessmentStatus: assessed\n' > "$R10/o__r/v1/release.yaml"
+printf 'pr: 5\nimpact: unnoticeable\nrisk: minor\n' > "$R10/o__r/v1/pr-6.yaml"
+bash "$SCRIPT" "$R10" >/dev/null 2>&1
+rel10="$R10/o__r/v1/release.md"
+{ [ -f "$R10/o__r/v1/pr-6.md" ] && grep -qF '[PR #6](pr-6.md)' "$rel10" && grep -qF '/pull/6' "$rel10" && ! grep -qF 'pr-5.md' "$rel10"; } \
+  && ok "T10 PR link uses filename, not internal pr:" || no "T10" "$(cat "$rel10")"
+
+# T11 missing internal pr: field still links correctly by filename
+R11="$TMP/r11"; mkdir -p "$R11/o__r/v1"
+printf 'repo: o/r\n' > "$R11/o__r/repo.yaml"
+printf 'tag: v1\nassessmentStatus: assessed\n' > "$R11/o__r/v1/release.yaml"
+printf 'impact: unnoticeable\nrisk: minor\n' > "$R11/o__r/v1/pr-77.yaml"
+bash "$SCRIPT" "$R11" >/dev/null 2>&1
+{ [ -f "$R11/o__r/v1/pr-77.md" ] && grep -qF '[PR #77](pr-77.md)' "$R11/o__r/v1/release.md"; } \
+  && ok "T11 missing pr: still links by filename" || no "T11" "$(cat "$R11/o__r/v1/release.md")"
+
+# T12 accepts assessedCoverage as an alias for coverage
+R12="$TMP/r12"; mkdir -p "$R12/o__r/v1"
+printf 'repo: o/r\n' > "$R12/o__r/repo.yaml"
+printf 'tag: v1\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nassessmentStatus: assessed\nassessedCoverage: "3/3"\n' > "$R12/o__r/v1/release.yaml"
+printf 'impact: unnoticeable\nrisk: minor\n' > "$R12/o__r/v1/pr-1.yaml"
+bash "$SCRIPT" "$R12" >/dev/null 2>&1
+grep -qF 'assessedCoverage: "3/3"' "$R12/o__r/v1/release.md" \
+  && ok "T12 accepts assessedCoverage alias" || no "T12" "$(cat "$R12/o__r/v1/release.md")"
+
+# T13 URL-encodes a slash in the tag (release page link stays valid)
+R13="$TMP/r13"; mkdir -p "$R13/o__r/hotfix__urgent"
+printf 'repo: o/r\n' > "$R13/o__r/repo.yaml"
+printf 'tag: hotfix/urgent\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nassessmentStatus: assessed\n' > "$R13/o__r/hotfix__urgent/release.yaml"
+printf 'impact: unnoticeable\nrisk: minor\n' > "$R13/o__r/hotfix__urgent/pr-1.yaml"
+bash "$SCRIPT" "$R13" >/dev/null 2>&1
+rel13="$R13/o__r/hotfix__urgent/release.md"
+{ grep -qF 'releases/tag/hotfix%2Furgent' "$rel13" && ! grep -qF 'releases/tag/hotfix/urgent' "$rel13"; } \
+  && ok "T13 URL-encodes slash in tag" || no "T13" "$(cat "$rel13")"
+
+# T14 a release.yaml nested below the flat layout is NOT silently dropped -> warns, exits 0
+R14="$TMP/r14"; mkdir -p "$R14/o__r/a/b"
+printf 'repo: o/r\n' > "$R14/o__r/repo.yaml"
+printf 'tag: deep\nassessmentStatus: assessed\n' > "$R14/o__r/a/b/release.yaml"
+OUT=$(bash "$SCRIPT" "$R14" 2>&1); RC=$?
+{ [ "$RC" -eq 0 ] && case "$OUT" in *"::warning::"*"nested below"*) true;; *) false;; esac; } \
+  && ok "T14 warns on release nested below flat layout" || no "T14" "$OUT (rc=$RC)"
 
 echo
 echo "-------- $pass passed, $fail failed --------"

@@ -21,8 +21,23 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 [ -d "$RUN" ] || { echo "::error::cmr-report: no such run dir: $RUN" >&2; exit 1; }
 
-yget(){ { grep -iE "^[[:space:]]*$2:" "$1" 2>/dev/null || true; } | head -1 | sed -E "s/^[^:]*:[[:space:]]*//; s/^[\"']//; s/[\"']$//"; }
+# Read one scalar for key $2 from yaml file $1. Trims whitespace; strips a *balanced*
+# surrounding quote pair (so a value merely ending in a quote is preserved); for an
+# unquoted value, drops a trailing ` # comment` — matching the release-cm.sh / cm-assess-pr.sh
+# parsers so the same data file renders and decorates identically.
+yget(){
+  local raw val
+  raw=$({ grep -iE "^[[:space:]]*$2:" "$1" 2>/dev/null || true; } | head -1)
+  val=$(printf '%s' "${raw#*:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+  case "$val" in
+    '"'*'"') val=${val#\"}; val=${val%\"} ;;
+    \'*\')   val=${val#\'}; val=${val%\'} ;;
+    *)       val=$(printf '%s' "$val" | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//') ;;
+  esac
+  printf '%s' "$val"
+}
 baseurl(){ case "$1" in git.corp.adobe.com) echo "https://git.corp.adobe.com";; *) echo "https://github.com";; esac; }
+urlenc(){ printf '%s' "${1//\//%2F}"; }  # encode '/' for tag path segments (monorepo/ref tags)
 
 nrepos=0; nrel=0; npr=0
 for repodir in "$RUN"/*/; do
@@ -36,12 +51,14 @@ for repodir in "$RUN"/*/; do
     tag=$(yget "${reldir}release.yaml" tag)
     rct=$(yget "${reldir}release.yaml" changeType); rim=$(yget "${reldir}release.yaml" impact); rrk=$(yget "${reldir}release.yaml" risk)
     rst=$(yget "${reldir}release.yaml" assessmentStatus); rcov=$(yget "${reldir}release.yaml" coverage)
-    relurl="$base/$repo/releases/tag/$tag"
+    [ -n "$rcov" ] || rcov=$(yget "${reldir}release.yaml" assessedCoverage)  # accept either field name
+    relurl="$base/$repo/releases/tag/$(urlenc "$tag")"
 
     for prf in "${reldir}"pr-*.yaml; do
       [ -e "$prf" ] || continue
       npr=$((npr+1))
-      n=$(yget "$prf" pr); ct=$(yget "$prf" changeType); im=$(yget "$prf" impact); rk=$(yget "$prf" risk)
+      n=$(basename "$prf" .yaml); n=${n#pr-}   # PR number is the filename, the authoritative link target
+      ct=$(yget "$prf" changeType); im=$(yget "$prf" impact); rk=$(yget "$prf" risk)
       title=$(yget "$prf" title); rat=$(yget "$prf" rationale)
       { echo "# PR #$n — $repo"; echo
         [ -n "$title" ] && echo "> $title" && echo
@@ -61,7 +78,7 @@ for repodir in "$RUN"/*/; do
       echo "assessmentStatus: ${rst}"; echo "assessedCoverage: \"${rcov}\""; echo '```'
       echo; echo "## PRs in this release"
       for prf in "${reldir}"pr-*.yaml; do [ -e "$prf" ] || continue
-        n=$(yget "$prf" pr); im=$(yget "$prf" impact); rk=$(yget "$prf" risk)
+        n=$(basename "$prf" .yaml); n=${n#pr-}; im=$(yget "$prf" impact); rk=$(yget "$prf" risk)
         echo "- [PR #$n](pr-$n.md) — ${im}/${rk} · [GitHub]($base/$repo/pull/$n)"
       done
     } > "${reldir}release.md"
@@ -87,9 +104,15 @@ done
   echo; echo "## Repos"; echo "| repo | releases |"; echo "|---|--:|"
   for repodir in "$RUN"/*/; do [ -f "${repodir}repo.yaml" ] || continue
     repo=$(yget "${repodir}repo.yaml" repo); od=$(basename "$repodir")
-    rn=$(find "$repodir" -mindepth 2 -name release.yaml 2>/dev/null | wc -l | tr -d " ")
+    # count only releases at the rendered depth, so this matches repo.md (not deeper strays)
+    rn=$({ find "$repodir" -mindepth 2 -maxdepth 2 -name release.yaml 2>/dev/null || true; } | wc -l | tr -d " ")
     printf "| [%s](%s/repo.md) | %s |\n" "$repo" "$od" "$rn"
   done
 } > "$RUN/README.md"
+
+# Guard the silent-coverage-hole failure mode: a release.yaml nested below the flat layout
+# (e.g. a tag containing '/' mirrored into folders) is not rendered — warn loudly, don't drop quietly.
+deep=$({ find "$RUN" -mindepth 4 -name release.yaml 2>/dev/null || true; } | wc -l | tr -d " ")
+[ "${deep:-0}" -gt 0 ] && echo "::warning::cmr-report: $deep release folder(s) nested below the flat layout were NOT rendered (non-flat tag folder?)" >&2 || true
 
 echo "cmr-report: wrote md tree under $RUN ($nrepos repos, $nrel releases, $npr PRs)"
