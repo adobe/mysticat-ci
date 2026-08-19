@@ -82,6 +82,14 @@ SNOW="$TMP/nope.yml" runa 2026-01-01 fix
 runa 2026-1-1 report; { [ "$RC" -eq 2 ]; } && ok "rejects malformed date" || no "date-validation" "$OUT (rc=$RC)"
 runa 2026-01-01 bogus; { [ "$RC" -eq 2 ]; } && ok "rejects bad mode" || no "mode-validation" "$OUT (rc=$RC)"
 
+# ---- OUT_DIR artifact persistence (manifest + per-release block) ----
+AOUT="$TMP/artifacts"
+OUT=$( SNOW_YML="$TMP/snow.yml" REPO=x/y OUT_DIR="$AOUT" bash "$AUDIT" 2026-01-01 suggest 2>&1 ); RC=$?
+{ [ -f "$AOUT/manifest.md" ] && grep -q '| v1.1.0 |' "$AOUT/manifest.md" && [ -f "$AOUT/v1.1.0.cm.yaml" ] \
+  && { ! command -v ruby >/dev/null 2>&1 || ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' "$AOUT/v1.1.0.cm.yaml" >/dev/null 2>&1; } \
+  && has 'artifacts written to' && [ "$RC" -eq 0 ]; } \
+  && ok "OUT_DIR persists manifest + valid per-release block" || no "OUT_DIR artifacts" "$OUT"
+
 echo
 echo "-------- $pass passed, $fail failed --------"
 [ "$fail" -eq 0 ]

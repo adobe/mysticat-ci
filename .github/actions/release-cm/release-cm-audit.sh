@@ -30,6 +30,18 @@ releases=$(gh release list -R "$REPO" -L 1000 --json tagName,publishedAt,isDraft
       | sort_by(.publishedAt) | .[] | "\(.tagName)\t\(.publishedAt)"') \
   || { echo "::error::cannot list releases for $REPO (check GH_TOKEN / repo access)" >&2; exit 1; }
 
+# Optional artifact persistence for review / sharing with stakeholders (OUT_DIR=<dir>):
+# a manifest.md status table + per-release .cm.yaml block files.
+OUT_DIR="${OUT_DIR:-}"
+if [ -n "$OUT_DIR" ]; then
+  mkdir -p "$OUT_DIR"
+  MANIFEST="$OUT_DIR/manifest.md"
+  { printf '# release-cm-audit — %s — since %s — mode %s\n\n' "$REPO" "$SINCE" "$MODE"
+    printf '| release | date | status |\n|---|---|---|\n'; } > "$MANIFEST"
+fi
+mrow()      { [ -n "$OUT_DIR" ] || return 0; printf '| %s | %s | %s |\n' "$1" "$2" "$3" >> "$MANIFEST"; }
+writeblock(){ [ -n "$OUT_DIR" ] || return 0; printf '%s\n' "$2" | awk '/```yaml/{f=1;next} f&&/^```/{exit} f{print}' > "$OUT_DIR/$1.cm.yaml"; }
+
 total=0; covered=0; gap=0; suggested=0; needsreview=0; fixed=0; failed=0
 echo "== release-cm-audit  repo=$REPO  since=$SINCE  mode=$MODE =="
 
@@ -39,12 +51,12 @@ while IFS=$'\t' read -r tag published; do
   day=${published%%T*}
   body=$(gh release view "$tag" -R "$REPO" --json body -q .body 2>/dev/null || true)
   if printf '%s\n' "$body" | grep -qE "$MARKER"; then
-    covered=$((covered + 1)); continue
+    covered=$((covered + 1)); mrow "$tag" "$day" "covered"; continue
   fi
   gap=$((gap + 1))
   case "$MODE" in
     report)
-      echo "GAP      $tag  $day  — no CM block"
+      echo "GAP      $tag  $day  — no CM block"; mrow "$tag" "$day" "GAP — no CM block"
       ;;
     suggest)
       if out=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
@@ -52,9 +64,10 @@ while IFS=$'\t' read -r tag published; do
         echo "SUGGEST  $tag  $day  assessmentStatus=${st:-?}"
         printf '%s\n' "$out" | awk '/```yaml/{f=1;print "    "$0;next} f&&/^```/{print "    "$0;exit} f{print "    "$0}'
         suggested=$((suggested + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
+        mrow "$tag" "$day" "suggested (${st:-?})"; writeblock "$tag" "$out"
       else
         echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
-        failed=$((failed + 1))
+        failed=$((failed + 1)); mrow "$tag" "$day" "FAILED"
       fi
       ;;
     fix)
@@ -62,9 +75,10 @@ while IFS=$'\t' read -r tag published; do
         st=$(printf '%s\n' "$out" | sed -nE 's/.*status=([a-z-]+).*/\1/p' | head -1)
         echo "FIXED    $tag  $day  ${st:+assessmentStatus=$st}"
         fixed=$((fixed + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
+        mrow "$tag" "$day" "fixed (${st:-?})"
       else
         echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
-        failed=$((failed + 1))
+        failed=$((failed + 1)); mrow "$tag" "$day" "FAILED"
       fi
       ;;
   esac
@@ -75,6 +89,7 @@ case "$MODE" in
   suggest) echo "-- suggested ${suggested} (of which ${needsreview} need review), ${failed} could not be generated --";;
   fix)     echo "-- fixed ${fixed} (of which ${needsreview} need review), ${failed} could not be generated --";;
 esac
+[ -n "$OUT_DIR" ] && echo "-- artifacts written to ${OUT_DIR} --"
 # fix mode signals a non-zero exit if any release could not be backfilled, so CI shows red.
 [ "$MODE" = fix ] && [ "$failed" -gt 0 ] && exit 1
 exit 0
