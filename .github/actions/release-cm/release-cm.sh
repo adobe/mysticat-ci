@@ -169,7 +169,7 @@ for n in $pr_nums; do
   # needs-review — a human must reduce them to one authoritative block (that is how override works).
   pr_body=$(printf '%s' "$pr_json" | jq -r '.body // ""')
   pr_impact=""; pr_risk=""; pr_ctype=""; pr_backout=""
-  impact_bad=""; risk_bad=""; flag=""; unparsed=""; conflict=""
+  impact_bad=""; risk_bad=""; flag=""; unparsed=""; conflict=""; ci=""; cr=""
   if printf '%s\n' "$pr_body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$'; then
     # Signature (impact|risk|changeType) of every CLOSED block; >1 distinct == conflicting blocks.
     sigs=$(printf '%s\n' "$pr_body" | awk '
@@ -179,10 +179,21 @@ for n in $pr_nums; do
       cap && /^[[:space:]]*risk:/       { if (rk=="") { s=$0; sub(/^[[:space:]]*risk:[[:space:]]*/,"",s);       sub(/[[:space:]#].*$/,"",s); rk=s } }
       cap && /^[[:space:]]*changeType:/ { if (ct=="") { s=$0; sub(/^[[:space:]]*changeType:[[:space:]]*/,"",s); sub(/[[:space:]#].*$/,"",s); ct=s } }')
     ndistinct=$({ printf '%s\n' "$sigs" | grep . || true; } | sort -u | wc -l | tr -d ' ')
-    if [ "${ndistinct:-0}" -gt 1 ]; then
-      conflict=1; unparsed=1; flag=1
+    nclosed=$({ printf '%s\n' "$sigs" | grep -c . || true; }); nclosed=${nclosed:-0}
+    nmarkers=$({ printf '%s\n' "$pr_body" | grep -cE '^[[:space:]]*cm-assessment: v1[[:space:]]*$' || true; }); nmarkers=${nmarkers:-0}
+    if [ "$nmarkers" -gt "$nclosed" ]; then
+      # a marker without a closing fence (possibly hiding behind a well-formed sibling block)
+      unparsed=1; flag=1; blk=""
+      log_warn "PR #$n: a cm-assessment block is not closed by a fence — needs-review"
+    elif [ "${ndistinct:-0}" -gt 1 ]; then
+      conflict=1; unparsed=1; flag=1; blk=""
       log_warn "PR #$n: multiple conflicting cm-assessment blocks — needs-review (leave exactly one authoritative block)"
-      blk=""
+      # Contribute the HIGHEST severity any block claimed so a conflict never UNDER-rates the
+      # release (the per-PR fields still show `unknown`; needs-review makes a human resolve it).
+      ci=$(printf '%s\n' "$sigs" | awk -F'|' 'function r(x){return x=="outage"?4:x=="degradation"?3:x=="unnoticeable"?2:x=="no-impact"?1:0}{v=r($1);if(v>b){b=v;o=$1}}END{print o}')
+      cr=$(printf '%s\n' "$sigs" | awk -F'|' 'function r(x){return x=="major"?2:x=="minor"?1:0}{v=r($2);if(v>b){b=v;o=$2}}END{print o}')
+      valid_impact "$ci" || ci=""
+      valid_risk   "$cr" || cr=""
     else
     blk=$(printf '%s\n' "$pr_body" | awk '
       /^[[:space:]]*cm-assessment: v1[[:space:]]*$/ { cap=1; buf=$0 ORS; next }
@@ -216,9 +227,11 @@ for n in $pr_nums; do
     [ -n "$flag" ] && { n_unknown=$((n_unknown + 1)); needs_review=1; }
   fi
 
-  # Aggregate = max. Unassessed/unknown fields use the baseline so they never lower the rating.
-  ir=$(impact_rank "${pr_impact:-unnoticeable}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
-  rr=$(risk_rank "${pr_risk:-minor}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
+  # Aggregate = max. Unassessed/unknown fields use the baseline so they never lower the rating;
+  # a conflicting PR contributes the highest severity any of its blocks claimed (ci/cr) so it is
+  # never under-rated while it waits for a human.
+  ir=$(impact_rank "${pr_impact:-${ci:-unnoticeable}}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
+  rr=$(risk_rank "${pr_risk:-${cr:-minor}}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
   # A PR is classified by its own nature (standard|normal); emergency is a deploy attribute
   # (context), so a PR that merely fixed an incident is IGNORED here and the change's own
   # severity governs — it does not make the bundling release emergency (or even normal).

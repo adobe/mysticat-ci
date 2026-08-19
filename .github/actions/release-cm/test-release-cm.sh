@@ -111,7 +111,7 @@ risk: minor')
 $(blk 'impact: degradation
 risk: major')" "$NOREV" "$NOLBL"
 run T7 v2
-{ has 'assessmentStatus: needs-review' && has 'impact: unknown' && has 'conflicting cm-assessment blocks' && [ "$RC" -eq 0 ]; } \
+{ has 'assessmentStatus: needs-review' && has 'impact: unknown' && has 'note: "multiple conflicting' && [ "$RC" -eq 0 ]; } \
   && ok "T7 conflicting blocks -> needs-review" || no "T7 conflicting blocks -> needs-review" "$OUT"
 
 # ---------- T7b IDENTICAL duplicate blocks (no disagreement) -> still assessed ----------
@@ -123,6 +123,32 @@ risk: major')" "$NOREV" "$NOLBL"
 run T7b v2
 { has 'impact: degradation' && has 'assessmentStatus: assessed' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
   && ok "T7b identical duplicate blocks -> assessed" || no "T7b identical duplicate blocks -> assessed" "$OUT"
+
+# ---------- T7c unclosed block hidden behind a well-formed sibling -> needs-review ----------
+mkfix T7c; printf 'fixes #703\n' > "$FIXROOT/T7c/release-body.txt"; echo null > "$FIXROOT/T7c/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T7c/releases.txt"
+mkpr T7c 703 alice 'cm-assessment: v1
+impact: outage
+risk: major
+cm-assessment: v1
+impact: unnoticeable
+risk: minor
+```' "$NOREV" "$NOLBL"
+run T7c v2
+{ has 'assessmentStatus: needs-review' && has 'impact: unknown' && has 'not closed by a fence' && [ "$RC" -eq 0 ]; } \
+  && ok "T7c unclosed block behind a sibling -> needs-review" || no "T7c unclosed-then-closed" "$OUT"
+
+# ---------- T7d partial conflict (agree on impact/risk, differ on changeType) ----------
+# per-PR shows unknown + needs-review, but the AGREED degradation/major must not be floored away
+mkfix T7d; printf 'fixes #704\n' > "$FIXROOT/T7d/release-body.txt"; echo null > "$FIXROOT/T7d/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T7d/releases.txt"
+mkpr T7d 704 alice "$(blk 'changeType: normal
+impact: degradation
+risk: major')
+$(blk 'changeType: standard
+impact: degradation
+risk: major')" "$NOREV" "$NOLBL"
+run T7d v2
+{ has 'assessmentStatus: needs-review' && has 'impact: degradation' && has 'risk: major' && [ "$RC" -eq 0 ]; } \
+  && ok "T7d partial conflict keeps the agreed aggregate" || no "T7d partial conflict" "$OUT"
 
 # ---------- T8 AI-agent approves bot PR -> independent true ----------
 mkfix T8; printf 'fixes #801\n' > "$FIXROOT/T8/release-body.txt"; echo null > "$FIXROOT/T8/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T8/releases.txt"

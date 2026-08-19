@@ -37,7 +37,9 @@ yget(){
   printf '%s' "$val"
 }
 baseurl(){ case "$1" in git.corp.adobe.com) echo "https://git.corp.adobe.com";; *) echo "https://github.com";; esac; }
-urlenc(){ printf '%s' "${1//\//%2F}"; }  # encode '/' for tag path segments (monorepo/ref tags)
+# Percent-encode the chars that would break a tag used as a URL path segment / markdown link
+# (monorepo & ref tags): space and % / # / ? / / in addition to a literal space.
+urlenc(){ local s="$1"; s=${s//\%/%25}; s=${s//\//%2F}; s=${s//' '/%20}; s=${s//\#/%23}; s=${s//\?/%3F}; printf '%s' "$s"; }
 
 nrepos=0; nrel=0; npr=0
 for repodir in "$RUN"/*/; do

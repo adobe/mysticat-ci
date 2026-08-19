@@ -129,6 +129,16 @@ OUT=$(bash "$SCRIPT" "$R14" 2>&1); RC=$?
 { [ "$RC" -eq 0 ] && case "$OUT" in *"::warning::"*"nested below"*) true;; *) false;; esac; } \
   && ok "T14 warns on release nested below flat layout" || no "T14" "$OUT (rc=$RC)"
 
+# T15 URL-encodes a space (and slash) in a tag so the release link stays valid
+R15="$TMP/r15"; mkdir -p "$R15/o__r/rel"
+printf 'repo: o/r\n' > "$R15/o__r/repo.yaml"
+printf 'tag: "team/release 2.0"\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nassessmentStatus: assessed\n' > "$R15/o__r/rel/release.yaml"
+printf 'impact: unnoticeable\nrisk: minor\n' > "$R15/o__r/rel/pr-1.yaml"
+bash "$SCRIPT" "$R15" >/dev/null 2>&1
+rel15="$R15/o__r/rel/release.md"
+grep -qF 'releases/tag/team%2Frelease%202.0' "$rel15" \
+  && ok "T15 URL-encodes space + slash in tag" || no "T15" "$(cat "$rel15")"
+
 echo
 echo "-------- $pass passed, $fail failed --------"
 [ "$fail" -eq 0 ]

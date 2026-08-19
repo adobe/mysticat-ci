@@ -42,7 +42,7 @@ printf '%s\n' \
   "v1.0.0	2026-01-15T00:00:00Z	" \
   "v0.9.0	2025-12-01T00:00:00Z	" > "$FIX/releases.tsv"
 # v1.0.0 already covered; v1.1.0 gap with an assessed PR; v1.2.0 gap, no PRs; v0.9.0 too old; rc excluded
-printf 'notes\n\n## Change Management\n\n```yaml\ncm-attributes: v1\nserviceIds: [1]\n```\n' > "$FIX/body-v1.0.0.txt"
+printf 'notes\n\n## Change Management\n\n```yaml\ncm-attributes: v1\nserviceIds: [1]\nchangeType: normal\nimpact: outage\nrisk: major\nassessmentStatus: assessed\nassessedCoverage: "1/1"\n```\n' > "$FIX/body-v1.0.0.txt"
 printf 'fixes #10\n' > "$FIX/body-v1.1.0.txt"
 printf 'chore: docs only\n' > "$FIX/body-v1.2.0.txt"
 printf 'old\n' > "$FIX/body-v0.9.0.txt"
@@ -87,11 +87,17 @@ AOUT="$TMP/run"
 OUT=$( SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$AOUT" bash "$AUDIT" 2026-01-01 suggest 2>&1 ); RC=$?
 RELY="$AOUT/x__y/v1.1.0/release.yaml"
 { [ -f "$AOUT/x__y/repo.yaml" ] && grep -q '^repo: x/y' "$AOUT/x__y/repo.yaml" \
-  && [ -f "$RELY" ] && grep -q '^tag: v1.1.0' "$RELY" && grep -q '^impact: degradation' "$RELY" \
+  && [ -f "$RELY" ] && grep -q '^tag: "v1.1.0"' "$RELY" && grep -q '^impact: degradation' "$RELY" \
   && [ -f "$AOUT/x__y/v1.1.0/pr-10.yaml" ] && grep -q '^pr: 10' "$AOUT/x__y/v1.1.0/pr-10.yaml" \
   && { ! command -v ruby >/dev/null 2>&1 || ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' "$RELY" >/dev/null 2>&1; } \
   && has 'render the tree with' && [ "$RC" -eq 0 ]; } \
   && ok "RUN persists nested repo/release/pr data" || no "RUN nested artifacts" "$OUT"
+
+# a COVERED release keeps its real changeType/impact/risk (parsed from the existing block), not a bare label
+COVY="$AOUT/x__y/v1.0.0/release.yaml"
+{ [ -f "$COVY" ] && grep -q '^impact: outage' "$COVY" && grep -q '^changeType: normal' "$COVY" \
+  && grep -q '^assessmentStatus: assessed' "$COVY"; } \
+  && ok "covered release keeps real block values" || no "covered real data" "$(cat "$COVY" 2>/dev/null)"
 
 # ---- the audit's data renders cleanly through cmr-report.sh (one shared scheme) ----
 REPORT="$HERE/cmr-report.sh"
@@ -103,6 +109,67 @@ if [ -f "$REPORT" ]; then
 else
   no "audit->cmr-report" "cmr-report.sh not found next to audit script"
 fi
+
+# ---- fix mode writes CORRECT data with a STATEFUL gh (regression: 2nd-DRY idempotency bug) ----
+# A real `release edit` persists the notes; the audit must capture the block from a DRY BEFORE
+# the edit, else the post-edit read hits the idempotency guard and writes `unassessed`/no PRs.
+BIN2="$TMP/bin2"; F2="$TMP/fix2"; mkdir -p "$BIN2" "$F2"
+cat > "$BIN2/gh" <<'SH'
+#!/usr/bin/env bash
+FIX="${FIX:?}"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then exit 0; fi
+if [ "$1" = "release" ] && [ "$2" = "list" ]; then
+  jq -Rn '[inputs|select(length>0)|split("\t")|{tagName:.[0],publishedAt:.[1],isDraft:false,isPrerelease:false}]' < "$FIX/releases.tsv"; exit 0
+fi
+if [ "$1" = "release" ] && [ "$2" = "view" ]; then
+  tag="$3"
+  case "$*" in
+    *publishedAt*) awk -F'\t' -v t="$tag" '$1==t{print $2}' "$FIX/releases.tsv"; exit 0;;
+    *body*)        cat "$FIX/body-$tag.txt" 2>/dev/null || echo ""; exit 0;;
+  esac
+fi
+if [ "$1" = "release" ] && [ "$2" = "edit" ]; then
+  tag="$3"; notes=""; while [ $# -gt 0 ]; do [ "$1" = "--notes" ] && { notes="$2"; break; }; shift; done
+  [ -n "$notes" ] && printf '%s' "$notes" > "$FIX/body-$tag.txt"; echo edited; exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  n="$3"; [ -f "$FIX/pr-$n.json" ] && { cat "$FIX/pr-$n.json"; exit 0; }
+  echo "no pr $n" >&2; exit 1
+fi
+exit 0
+SH
+chmod +x "$BIN2/gh"
+printf 'v9.9.9\t2026-05-01T00:00:00Z\t\n' > "$F2/releases.tsv"
+printf 'fixes #909\n' > "$F2/body-v9.9.9.txt"
+jq -n '{author:{login:"al"},labels:[],reviews:[],body:"## Change Management\n\n```yaml\ncm-assessment: v1\nimpact: degradation\nrisk: major\n```\n"}' > "$F2/pr-909.json"
+RUN2="$TMP/run2"
+OUT=$( PATH="$BIN2:$PATH" FIX="$F2" SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$RUN2" bash "$AUDIT" 2026-01-01 fix 2>&1 ); RC=$?
+RELY2="$RUN2/x__y/v9.9.9/release.yaml"
+{ has 'FIXED    v9.9.9' && [ -f "$RELY2" ] && grep -q '^impact: degradation' "$RELY2" && grep -q '^risk: major' "$RELY2" \
+  && ! grep -q '^assessmentStatus: unassessed' "$RELY2" && [ -f "$RUN2/x__y/v9.9.9/pr-909.yaml" ] && [ "$RC" -eq 0 ]; } \
+  && ok "fix persists real data (stateful gh, DRY-before-edit)" || no "fix data regression" "$OUT
+--- release.yaml ---
+$(cat "$RELY2" 2>/dev/null)"
+
+# ---- suggest never aborts when a gap PR has no assessment (empty risk row; set -e safety) ----
+F3="$TMP/fix3"; mkdir -p "$F3"
+printf 'v8.0.0\t2026-05-01T00:00:00Z\t\n' > "$F3/releases.tsv"
+printf 'fixes #808\n' > "$F3/body-v8.0.0.txt"
+jq -n '{author:{login:"al"},labels:[],reviews:[],body:"no assessment here"}' > "$F3/pr-808.json"
+OUT=$( FIX="$F3" SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$TMP/run3" bash "$AUDIT" 2026-01-01 suggest 2>&1 ); RC=$?
+{ has 'SUGGEST  v8.0.0' && has 'render the tree with' && [ "$RC" -eq 0 ]; } \
+  && ok "suggest with an unassessed PR does not abort (set -e)" || no "suggest set -e abort" "$OUT (rc=$RC)"
+
+# ---- tagsafe is injective: two distinct tags that sanitise alike land in DIFFERENT folders ----
+F4="$TMP/fix4"; mkdir -p "$F4"
+printf 'v7.0/rc1\t2026-05-01T00:00:00Z\t\nv7.0_rc1\t2026-05-02T00:00:00Z\t\n' > "$F4/releases.tsv"
+printf 'x\n' > "$F4/body-v7.0/rc1.txt" 2>/dev/null || true   # slash in filename won'"'"'t exist; view returns empty -> gap
+printf 'x\n' > "$F4/body-v7.0_rc1.txt"
+OUT=$( FIX="$F4" SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$TMP/run4" bash "$AUDIT" 2026-01-01 report 2>&1 ); RC=$?
+ndirs=$(find "$TMP/run4/x__y" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+{ [ "$ndirs" -eq 2 ] && [ "$RC" -eq 0 ]; } \
+  && ok "tagsafe injective: distinct tags -> distinct folders" || no "tagsafe collision" "ndirs=$ndirs rc=$RC
+$OUT"
 
 echo
 echo "-------- $pass passed, $fail failed --------"

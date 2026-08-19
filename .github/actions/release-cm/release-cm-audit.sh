@@ -41,20 +41,31 @@ if [ -n "$RUN" ]; then
   mkdir -p "$repodir"
   [ -f "$repodir/repo.yaml" ] || printf 'repo: %s\nhost: %s\n' "$REPO" "${GH_HOST:-github.com}" > "$repodir/repo.yaml"
 fi
-tagsafe(){ printf '%s' "$1" | sed 's#[^A-Za-z0-9._-]#_#g'; }   # enforce a flat, path-safe folder name
+yamlstr(){ jq -Rn --arg s "$1" '$s'; }   # single-line YAML-safe scalar (matches release-cm.sh)
 
-# Minimal release.yaml (report mode + fallbacks): tag + a coverage/status label.
+# Flat, path-safe, INJECTIVE folder name: sanitize unsafe chars, and when that changed anything
+# append a short hash of the RAW tag so two distinct tags can never collide into one folder.
+tagsafe(){
+  local raw safe
+  raw="$1"; safe=$(printf '%s' "$raw" | sed 's#[^A-Za-z0-9._-]#_#g')
+  [ "$safe" = "$raw" ] || safe="${safe}-$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+  printf '%s' "$safe"
+}
+
+# Minimal release.yaml (report-mode gap + fallbacks): tag + a status label.
 write_status(){
   [ -n "$RUN" ] || return 0
   local d; d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"
-  printf 'tag: %s\nassessmentStatus: %s\n' "$1" "$2" > "$d/release.yaml"
+  { printf 'tag: %s\n' "$(yamlstr "$1")"; printf 'assessmentStatus: %s\n' "$2"; } > "$d/release.yaml"
+  return 0
 }
 
-# release.yaml (+ per-PR pr-<n>.yaml) parsed from a release-cm DRY block ($2 = its full output).
-# A pr-<n>.yaml the agent already authored (richer: rationale/title) is kept, not overwritten.
+# release.yaml (+ per-PR pr-<n>.yaml) parsed from a cm block: $2 is either a release-cm DRY output
+# or a covered release body — both carry a fenced ```yaml``` block. A pr-<n>.yaml the agent already
+# authored (richer: rationale/title) is kept, not overwritten.
 write_release(){
   [ -n "$RUN" ] || return 0
-  local d blk ct im rk st cov
+  local d blk ct im rk st cov f pn pim prk
   d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"
   blk=$(printf '%s\n' "$2" | awk '/```yaml/{f=1;next} f&&/^```/{exit} f{print}')
   ct=$(printf  '%s\n' "$blk" | sed -nE 's/^changeType:[[:space:]]*([a-z]+).*/\1/p'  | head -1)
@@ -62,12 +73,13 @@ write_release(){
   rk=$(printf  '%s\n' "$blk" | sed -nE 's/^risk:[[:space:]]*([a-z]+).*/\1/p'         | head -1)
   st=$(printf  '%s\n' "$blk" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1)
   cov=$({ printf '%s\n' "$blk" | grep -E '^assessedCoverage:' || true; } | head -1 | sed -E 's/^assessedCoverage:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//')
-  { printf 'tag: %s\n' "$1"
-    [ -n "$ct" ]  && printf 'changeType: %s\n' "$ct"
-    [ -n "$im" ]  && printf 'impact: %s\n' "$im"
-    [ -n "$rk" ]  && printf 'risk: %s\n' "$rk"
+  {
+    printf 'tag: %s\n' "$(yamlstr "$1")"
+    if [ -n "$ct" ];  then printf 'changeType: %s\n' "$ct"; fi
+    if [ -n "$im" ];  then printf 'impact: %s\n' "$im"; fi
+    if [ -n "$rk" ];  then printf 'risk: %s\n' "$rk"; fi
     printf 'assessmentStatus: %s\n' "${st:-unassessed}"
-    [ -n "$cov" ] && printf 'coverage: "%s"\n' "$cov"
+    if [ -n "$cov" ]; then printf 'coverage: "%s"\n' "$cov"; fi
   } > "$d/release.yaml"
   # per-PR rows come from the changes: list (impact/risk only; the agent enriches later)
   { printf '%s\n' "$blk" | awk '
@@ -78,9 +90,14 @@ write_release(){
       END{ if(pr!="")print pr"\t"im"\t"rk }' ; } | while IFS=$'\t' read -r pn pim prk; do
     [ -n "$pn" ] || continue
     f="$d/pr-$pn.yaml"
-    [ -f "$f" ] && continue
-    { printf 'pr: %s\n' "$pn"; [ -n "$pim" ] && printf 'impact: %s\n' "$pim"; [ -n "$prk" ] && printf 'risk: %s\n' "$prk"; } > "$f"
+    if [ -f "$f" ]; then continue; fi
+    {
+      printf 'pr: %s\n' "$pn"
+      if [ -n "$pim" ]; then printf 'impact: %s\n' "$pim"; fi
+      if [ -n "$prk" ]; then printf 'risk: %s\n' "$prk"; fi
+    } > "$f"
   done
+  return 0
 }
 
 total=0; covered=0; gap=0; suggested=0; needsreview=0; fixed=0; failed=0
@@ -92,7 +109,8 @@ while IFS=$'\t' read -r tag published; do
   day=${published%%T*}
   body=$(gh release view "$tag" -R "$REPO" --json body -q .body 2>/dev/null || true)
   if printf '%s\n' "$body" | grep -qE "$MARKER"; then
-    covered=$((covered + 1)); write_status "$tag" covered; continue
+    # already decorated — record the real block's values (not a bare "covered" label), untouched
+    covered=$((covered + 1)); write_release "$tag" "$body"; continue
   fi
   gap=$((gap + 1))
   case "$MODE" in
@@ -112,14 +130,20 @@ while IFS=$'\t' read -r tag published; do
       fi
       ;;
     fix)
-      if out=$(REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
-        st=$(printf '%s\n' "$out" | sed -nE 's/.*status=([a-z-]+).*/\1/p' | head -1)
-        echo "FIXED    $tag  $day  ${st:+assessmentStatus=$st}"
-        fixed=$((fixed + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
-        # capture the block via a DRY pass so the shared data files reflect what was written
-        dry=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1) && write_release "$tag" "$dry" || write_status "$tag" "${st:-fixed}"
+      # Capture the block from a DRY pass BEFORE the real edit — afterwards the live body already
+      # carries the block and DRY would short-circuit on the idempotency guard (no block emitted).
+      if dry=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
+        st=$(printf '%s\n' "$dry" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1)
+        if out=$(REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
+          echo "FIXED    $tag  $day  ${st:+assessmentStatus=$st}"
+          fixed=$((fixed + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
+          write_release "$tag" "$dry"
+        else
+          echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
+          failed=$((failed + 1)); write_status "$tag" failed
+        fi
       else
-        echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
+        echo "FAILED   $tag  $day  — $(printf '%s\n' "$dry" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
         failed=$((failed + 1)); write_status "$tag" failed
       fi
       ;;
