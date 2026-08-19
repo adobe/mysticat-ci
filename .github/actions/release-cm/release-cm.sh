@@ -245,7 +245,10 @@ if [ -n "$high_risk" ]; then
 fi
 impact=$(impact_name "$agg_impact")
 risk=$(risk_name "$agg_risk")
-sev_ct=0; { [ "$agg_risk" -ge 1 ] || [ "$agg_impact" -ge 2 ]; } && sev_ct=1
+# Gate on RISK (reversibility/recoverability), not blast-radius alone: a reversible/recoverable
+# `degradation` stays standard; only `major` risk (or an `outage` impact, which is by definition
+# unrecoverable/product-wide) escalates to normal.
+sev_ct=0; { [ "$agg_risk" -ge 1 ] || [ "$agg_impact" -ge 3 ]; } && sev_ct=1
 [ "$sev_ct" -gt "$agg_ctype" ] && agg_ctype=$sev_ct
 change_type=$(ctype_name "$agg_ctype")   # standard | normal from the change's nature
 # Emergency is dictated by the DEPLOY, not by a bundled change: an out-of-band urgent hotfix

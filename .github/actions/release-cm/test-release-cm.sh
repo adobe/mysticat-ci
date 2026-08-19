@@ -284,6 +284,14 @@ risk: minor')" "$NOREV" "$NOLBL"
 run T30 v2-hotfix-1
 { has 'changeType: emergency' && [ "$RC" -eq 0 ]; } && ok "T30 hotfix tag => emergency" || no "T30 hotfix tag => emergency" "$OUT"
 
+# ---------- T31 reversible degradation (impact degradation, risk minor) stays standard ----------
+mkfix T31; printf 'fixes #3100\n' > "$FIXROOT/T31/release-body.txt"; echo null > "$FIXROOT/T31/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T31/releases.txt"
+mkpr T31 3100 alice "$(blk 'impact: degradation
+risk: minor')" "$NOREV" "$NOLBL"
+run T31 v2
+{ has 'impact: degradation' && has 'risk: minor' && has 'changeType: standard' && ! has 'changeType: normal' && [ "$RC" -eq 0 ]; } \
+  && ok "T31 reversible degradation stays standard (gate is risk, not impact)" || no "T31 reversible degradation stays standard" "$OUT"
+
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"
