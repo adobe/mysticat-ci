@@ -31,6 +31,10 @@ rsk=$(lc "$(printf '%s\n' "$fields" | sed -nE 's/^[[:space:]]*risk:[[:space:]]*(
 case "$imp" in no-impact|unnoticeable|degradation|outage) ;; *) log_err "assessment needs a valid impact (got '${imp:-none}')"; exit 2;; esac
 case "$rsk" in minor|major) ;; *) log_err "assessment needs a valid risk (got '${rsk:-none}')"; exit 2;; esac
 
+# The audit persists one unified pr-<n>.yaml per PR (it also feeds the md report). Drop the
+# report-only keys so only the assessment itself lands in the PR body's cm-assessment block.
+fields=$(printf '%s\n' "$fields" | grep -vE '^[[:space:]]*(pr|title):' || true)
+
 body=$(gh pr view "$PR" -R "$REPO" --json body -q .body 2>/dev/null) \
   || { log_err "cannot read PR #$PR (check pull-requests scope / repo access)"; exit 1; }
 if printf '%s\n' "$body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$' && [ -z "${FORCE:-}" ]; then

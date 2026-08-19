@@ -52,6 +52,12 @@ PRN=11 FLD="$TMP/f.good" DRY_RUN=1 FORCE=1 run
 PRN=10 FLD="$TMP/f.good" run
 { has 'wrote cm-assessment to PR #10' && [ "$RC" -eq 0 ]; } && ok "A6 non-dry writes" || no "A6" "$OUT"
 
+# A7 unified pr-<n>.yaml (report-only pr/title keys) -> stripped from the embedded block
+printf 'pr: 10\ntitle: some PR title\nchangeType: normal\nimpact: degradation\nrisk: major\nrationale: "x"\n' > "$TMP/f.unified"
+PRN=10 FLD="$TMP/f.unified" DRY_RUN=1 run
+{ has 'impact: degradation' && has 'risk: major' && ! has 'pr: 10' && ! has 'title: some PR title' && [ "$RC" -eq 0 ]; } \
+  && ok "A7 strips report-only pr/title keys" || no "A7" "$OUT"
+
 echo
 echo "-------- $pass passed, $fail failed --------"
 [ "$fail" -eq 0 ]
