@@ -269,6 +269,21 @@ run T28 v2
 { has 'assessmentStatus: assessed' && has 'rollback via the feature flag toggle' && ! has 'assessmentStatus: needs-review' && yaml_ok && [ "$RC" -eq 0 ]; } \
   && ok "T28 free-text backout starting with > kept" || no "T28 free-text backout starting with > kept" "$OUT"
 
+# ---------- T29 PR-declared emergency is clamped: a scheduled release is NOT emergency ----------
+mkfix T29; printf 'fixes #2901\n' > "$FIXROOT/T29/release-body.txt"; echo null > "$FIXROOT/T29/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T29/releases.txt"
+mkpr T29 2901 alice "$(blk 'changeType: emergency
+impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"
+run T29 v2
+{ has 'changeType: standard' && ! has 'changeType: emergency' && [ "$RC" -eq 0 ]; } && ok "T29 PR emergency clamped (release not emergency)" || no "T29 PR emergency clamped" "$OUT"
+
+# ---------- T30 hotfix-style tag -> release changeType emergency ----------
+mkfix T30; printf 'fixes #2902\n' > "$FIXROOT/T30/release-body.txt"; echo null > "$FIXROOT/T30/published.txt"; printf 'v2-hotfix-1\nv2\n' > "$FIXROOT/T30/releases.txt"
+mkpr T30 2902 alice "$(blk 'impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"
+run T30 v2-hotfix-1
+{ has 'changeType: emergency' && [ "$RC" -eq 0 ]; } && ok "T30 hotfix tag => emergency" || no "T30 hotfix tag => emergency" "$OUT"
+
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"

@@ -25,7 +25,9 @@
 #                 floors at the §3.1.1 baseline (unnoticeable/minor); an ASSESSED PR uses its
 #                 own value (which may be no-impact); the release takes the max. The
 #                 cmr:high-risk label is an optional escalate-only floor (block = primary signal).
-#   changeType    max of the PRs' declared changeType and the severity-derived model.
+#   changeType    standard|normal from the change's nature (severity); emergency is set only
+#                 from a release-level signal (a hotfix-style tag or RELEASE_CM_EMERGENCY), never
+#                 aggregated up from a PR that merely fixed an incident.
 #   changes[]     per merged PR: author, approving reviewer login(s) (each reviewer's latest
 #                 review, kept only if APPROVED), independentlyApproved (a reviewer other than
 #                 the author AND not the CI identity approved — human or AI agent; an
@@ -199,6 +201,10 @@ for n in $pr_nums; do
   # Aggregate = max. Unassessed/unknown fields use the baseline so they never lower the rating.
   ir=$(impact_rank "${pr_impact:-unnoticeable}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
   rr=$(risk_rank "${pr_risk:-minor}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
+  # A PR is classified by its own nature (standard|normal); emergency is a deploy attribute
+  # (context), so a PR that merely fixed an incident is IGNORED here and the change's own
+  # severity governs — it does not make the bundling release emergency (or even normal).
+  [ "$pr_ctype" = emergency ] && pr_ctype=""
   if [ -n "$pr_ctype" ]; then cr=$(ctype_rank "$pr_ctype"); [ "$cr" -gt "$agg_ctype" ] && agg_ctype=$cr; fi
 
   # Per-PR display: each field shows its value if valid, `unknown` if present-but-invalid or
@@ -241,7 +247,12 @@ impact=$(impact_name "$agg_impact")
 risk=$(risk_name "$agg_risk")
 sev_ct=0; { [ "$agg_risk" -ge 1 ] || [ "$agg_impact" -ge 2 ]; } && sev_ct=1
 [ "$sev_ct" -gt "$agg_ctype" ] && agg_ctype=$sev_ct
-change_type=$(ctype_name "$agg_ctype")
+change_type=$(ctype_name "$agg_ctype")   # standard | normal from the change's nature
+# Emergency is dictated by the DEPLOY, not by a bundled change: an out-of-band urgent hotfix
+# deploy. Detect it from the release itself (a hotfix-style tag, or an explicit operator flag);
+# never aggregate it up from a PR.
+case "$TAG" in *[Hh]otfix*|*[Ee]mergency*) change_type=emergency;; esac
+[ -n "${RELEASE_CM_EMERGENCY:-}" ] && change_type=emergency
 
 # --- assessmentStatus: the coverage/confidence signal a human scans for.
 if   [ -n "$needs_review" ];              then status=needs-review
