@@ -90,6 +90,7 @@ RELY="$AOUT/x__y/v1.1.0/release.yaml"
 { [ -f "$AOUT/x__y/repo.yaml" ] && grep -q '^repo: x/y' "$AOUT/x__y/repo.yaml" \
   && [ -f "$RELY" ] && grep -q '^tag: "v1.1.0"' "$RELY" && grep -q '^impact: degradation' "$RELY" \
   && [ -f "$AOUT/x__y/v1.1.0/pr-10.yaml" ] && grep -q '^pr: 10' "$AOUT/x__y/v1.1.0/pr-10.yaml" \
+  && grep -q '^impact: degradation' "$AOUT/x__y/v1.1.0/pr-10.yaml" && grep -q '^risk: major' "$AOUT/x__y/v1.1.0/pr-10.yaml" \
   && { ! command -v ruby >/dev/null 2>&1 || ruby -ryaml -e 'YAML.safe_load(File.read(ARGV[0]))' "$RELY" >/dev/null 2>&1; } \
   && has 'render the tree with' && [ "$RC" -eq 0 ]; } \
   && ok "RUN persists nested repo/release/pr data" || no "RUN nested artifacts" "$OUT"
@@ -146,11 +147,15 @@ jq -n '{author:{login:"al"},labels:[],reviews:[],body:"## Change Management\n\n`
 RUN2="$TMP/run2"
 OUT=$( PATH="$BIN2:$PATH" FIX="$F2" SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$RUN2" bash "$AUDIT" 2026-01-01 fix 2>&1 ); RC=$?
 RELY2="$RUN2/x__y/v9.9.9/release.yaml"
+PRY2="$RUN2/x__y/v9.9.9/pr-909.yaml"
 { has 'FIXED    v9.9.9' && [ -f "$RELY2" ] && grep -q '^impact: degradation' "$RELY2" && grep -q '^risk: major' "$RELY2" \
-  && ! grep -q '^assessmentStatus: unassessed' "$RELY2" && [ -f "$RUN2/x__y/v9.9.9/pr-909.yaml" ] && [ "$RC" -eq 0 ]; } \
+  && ! grep -q '^assessmentStatus: unassessed' "$RELY2" \
+  && [ -f "$PRY2" ] && grep -q '^impact: degradation' "$PRY2" && grep -q '^risk: major' "$PRY2" && [ "$RC" -eq 0 ]; } \
   && ok "fix persists real data (stateful gh, DRY-before-edit)" || no "fix data regression" "$OUT
 --- release.yaml ---
-$(cat "$RELY2" 2>/dev/null)"
+$(cat "$RELY2" 2>/dev/null)
+--- pr-909.yaml ---
+$(cat "$PRY2" 2>/dev/null)"
 
 # ---- suggest never aborts when a gap PR has no assessment (empty risk row; set -e safety) ----
 F3="$TMP/fix3"; mkdir -p "$F3"
@@ -164,8 +169,7 @@ OUT=$( FIX="$F3" SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$TMP/run3" bash "$AUDIT"
 # ---- tagsafe is injective: two distinct tags that sanitise alike land in DIFFERENT folders ----
 F4="$TMP/fix4"; mkdir -p "$F4"
 printf 'v7.0/rc1\t2026-05-01T00:00:00Z\t\nv7.0_rc1\t2026-05-02T00:00:00Z\t\n' > "$F4/releases.tsv"
-printf 'x\n' > "$F4/body-v7.0/rc1.txt" 2>/dev/null || true   # slash in filename won'"'"'t exist; view returns empty -> gap
-printf 'x\n' > "$F4/body-v7.0_rc1.txt"
+# no body files: `release view --body` returns empty -> both are gaps (report mode, no writes to GitHub)
 OUT=$( FIX="$F4" SNOW_YML="$TMP/snow.yml" REPO=x/y RUN="$TMP/run4" bash "$AUDIT" 2026-01-01 report 2>&1 ); RC=$?
 ndirs=$(find "$TMP/run4/x__y" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 { [ "$ndirs" -eq 2 ] && [ "$RC" -eq 0 ]; } \

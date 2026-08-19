@@ -151,6 +151,16 @@ repo16="$R16/o__r/repo.md"; rel16="$R16/o__r/rel/release.md"
   && ! grep -qF 'tag/v1|x)y' "$rel16"; } \
   && ok "T16 hostile tag escaped in text + encoded in URL" || no "T16" "$(cat "$repo16"; echo ---; cat "$rel16")"
 
+# T17 a non-ASCII tag is percent-encoded as UTF-8 BYTES (not codepoints) in the URL
+R17="$TMP/r17"; mkdir -p "$R17/o__r/rel"
+printf 'repo: o/r\n' > "$R17/o__r/repo.yaml"
+printf 'tag: "caf\xc3\xa9"\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nassessmentStatus: assessed\n' > "$R17/o__r/rel/release.yaml"
+printf 'impact: unnoticeable\nrisk: minor\n' > "$R17/o__r/rel/pr-1.yaml"
+bash "$SCRIPT" "$R17" >/dev/null 2>&1
+rel17="$R17/o__r/rel/release.md"
+{ grep -qF 'releases/tag/caf%C3%A9' "$rel17" && ! grep -qF 'caf%E9' "$rel17"; } \
+  && ok "T17 non-ASCII tag percent-encoded as UTF-8 bytes" || no "T17" "$(cat "$rel17")"
+
 echo
 echo "-------- $pass passed, $fail failed --------"
 [ "$fail" -eq 0 ]

@@ -38,9 +38,11 @@ yget(){
 }
 baseurl(){ case "$1" in git.corp.adobe.com) echo "https://git.corp.adobe.com";; *) echo "https://github.com";; esac; }
 # Percent-encode a value for a URL path segment: allowlist the RFC-3986 unreserved set and
-# encode every other byte, so no tag char (space, ), |, backtick, <, >, …) can break the link.
+# encode every other BYTE, so no tag char (space, ), |, backtick, <, >, …) can break the link.
+# LC_ALL=C forces byte (not codepoint) iteration so a UTF-8 tag encodes to correct %XX bytes.
 urlenc(){
   local s="$1" out="" i c
+  local LC_ALL=C
   for (( i=0; i<${#s}; i++ )); do
     c=${s:i:1}
     case "$c" in [A-Za-z0-9._~-]) out+="$c";; *) out+=$(printf '%%%02X' "'$c");; esac

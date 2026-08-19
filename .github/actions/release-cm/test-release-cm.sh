@@ -147,8 +147,9 @@ $(blk 'changeType: standard
 impact: degradation
 risk: major')" "$NOREV" "$NOLBL"
 run T7d v2
-{ has 'assessmentStatus: needs-review' && has 'impact: degradation' && has 'risk: major' && [ "$RC" -eq 0 ]; } \
-  && ok "T7d partial conflict keeps the agreed aggregate" || no "T7d partial conflict" "$OUT"
+{ has 'assessmentStatus: needs-review' && has 'impact: degradation' && has 'risk: major' \
+  && has 'impact: unknown' && has 'risk: unknown' && [ "$RC" -eq 0 ]; } \
+  && ok "T7d partial conflict: aggregate kept, per-PR unknown" || no "T7d partial conflict" "$OUT"
 
 # ---------- T8 AI-agent approves bot PR -> independent true ----------
 mkfix T8; printf 'fixes #801\n' > "$FIXROOT/T8/release-body.txt"; echo null > "$FIXROOT/T8/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T8/releases.txt"
