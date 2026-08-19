@@ -42,7 +42,8 @@ printf '%s\n' \
   "v1.0.0	2026-01-15T00:00:00Z	" \
   "v0.9.0	2025-12-01T00:00:00Z	" > "$FIX/releases.tsv"
 # v1.0.0 already covered; v1.1.0 gap with an assessed PR; v1.2.0 gap, no PRs; v0.9.0 too old; rc excluded
-printf 'notes\n\n## Change Management\n\n```yaml\ncm-attributes: v1\nserviceIds: [1]\nchangeType: normal\nimpact: outage\nrisk: major\nassessmentStatus: assessed\nassessedCoverage: "1/1"\n```\n' > "$FIX/body-v1.0.0.txt"
+# a DECOY ```yaml``` block precedes the CM block — write_release must anchor on cm-attributes, not the first fence
+printf 'notes\n\n```yaml\nexample: changelog\nfoo: bar\n```\n\n## Change Management\n\n```yaml\ncm-attributes: v1\nserviceIds: [1]\nchangeType: normal\nimpact: outage\nrisk: major\nassessmentStatus: assessed\nassessedCoverage: "1/1"\n```\n' > "$FIX/body-v1.0.0.txt"
 printf 'fixes #10\n' > "$FIX/body-v1.1.0.txt"
 printf 'chore: docs only\n' > "$FIX/body-v1.2.0.txt"
 printf 'old\n' > "$FIX/body-v0.9.0.txt"

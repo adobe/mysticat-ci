@@ -169,7 +169,7 @@ for n in $pr_nums; do
   # needs-review — a human must reduce them to one authoritative block (that is how override works).
   pr_body=$(printf '%s' "$pr_json" | jq -r '.body // ""')
   pr_impact=""; pr_risk=""; pr_ctype=""; pr_backout=""
-  impact_bad=""; risk_bad=""; flag=""; unparsed=""; conflict=""; ci=""; cr=""
+  impact_bad=""; risk_bad=""; flag=""; unparsed=""; conflict=""; conf_im=""; conf_rk=""
   if printf '%s\n' "$pr_body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$'; then
     # Signature (impact|risk|changeType) of every CLOSED block; >1 distinct == conflicting blocks.
     sigs=$(printf '%s\n' "$pr_body" | awk '
@@ -190,10 +190,10 @@ for n in $pr_nums; do
       log_warn "PR #$n: multiple conflicting cm-assessment blocks — needs-review (leave exactly one authoritative block)"
       # Contribute the HIGHEST severity any block claimed so a conflict never UNDER-rates the
       # release (the per-PR fields still show `unknown`; needs-review makes a human resolve it).
-      ci=$(printf '%s\n' "$sigs" | awk -F'|' 'function r(x){return x=="outage"?4:x=="degradation"?3:x=="unnoticeable"?2:x=="no-impact"?1:0}{v=r($1);if(v>b){b=v;o=$1}}END{print o}')
-      cr=$(printf '%s\n' "$sigs" | awk -F'|' 'function r(x){return x=="major"?2:x=="minor"?1:0}{v=r($2);if(v>b){b=v;o=$2}}END{print o}')
-      valid_impact "$ci" || ci=""
-      valid_risk   "$cr" || cr=""
+      conf_im=$(printf '%s\n' "$sigs" | awk -F'|' 'function r(x){return x=="outage"?4:x=="degradation"?3:x=="unnoticeable"?2:x=="no-impact"?1:0}{v=r($1);if(v>b){b=v;o=$1}}END{print o}')
+      conf_rk=$(printf '%s\n' "$sigs" | awk -F'|' 'function r(x){return x=="major"?2:x=="minor"?1:0}{v=r($2);if(v>b){b=v;o=$2}}END{print o}')
+      valid_impact "$conf_im" || conf_im=""
+      valid_risk   "$conf_rk" || conf_rk=""
     else
     blk=$(printf '%s\n' "$pr_body" | awk '
       /^[[:space:]]*cm-assessment: v1[[:space:]]*$/ { cap=1; buf=$0 ORS; next }
@@ -230,8 +230,8 @@ for n in $pr_nums; do
   # Aggregate = max. Unassessed/unknown fields use the baseline so they never lower the rating;
   # a conflicting PR contributes the highest severity any of its blocks claimed (ci/cr) so it is
   # never under-rated while it waits for a human.
-  ir=$(impact_rank "${pr_impact:-${ci:-unnoticeable}}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
-  rr=$(risk_rank "${pr_risk:-${cr:-minor}}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
+  ir=$(impact_rank "${pr_impact:-${conf_im:-unnoticeable}}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
+  rr=$(risk_rank "${pr_risk:-${conf_rk:-minor}}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
   # A PR is classified by its own nature (standard|normal); emergency is a deploy attribute
   # (context), so a PR that merely fixed an incident is IGNORED here and the change's own
   # severity governs — it does not make the bundling release emergency (or even normal).

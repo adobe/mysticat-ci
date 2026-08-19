@@ -139,6 +139,18 @@ rel15="$R15/o__r/rel/release.md"
 grep -qF 'releases/tag/team%2Frelease%202.0' "$rel15" \
   && ok "T15 URL-encodes space + slash in tag" || no "T15" "$(cat "$rel15")"
 
+# T16 a hostile tag ('|' breaks tables, ')' truncates links) is escaped in text and encoded in URLs
+R16="$TMP/r16"; mkdir -p "$R16/o__r/rel"
+printf 'repo: o/r\n' > "$R16/o__r/repo.yaml"
+printf 'tag: "v1|x)y"\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nassessmentStatus: assessed\n' > "$R16/o__r/rel/release.yaml"
+printf 'impact: unnoticeable\nrisk: minor\n' > "$R16/o__r/rel/pr-1.yaml"
+bash "$SCRIPT" "$R16" >/dev/null 2>&1
+repo16="$R16/o__r/repo.md"; rel16="$R16/o__r/rel/release.md"
+{ grep -qF 'v1\|x\)y' "$repo16" \
+  && grep -qF 'releases/tag/v1%7Cx%29y' "$rel16" \
+  && ! grep -qF 'tag/v1|x)y' "$rel16"; } \
+  && ok "T16 hostile tag escaped in text + encoded in URL" || no "T16" "$(cat "$repo16"; echo ---; cat "$rel16")"
+
 echo
 echo "-------- $pass passed, $fail failed --------"
 [ "$fail" -eq 0 ]

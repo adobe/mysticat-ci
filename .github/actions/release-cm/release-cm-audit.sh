@@ -43,35 +43,55 @@ if [ -n "$RUN" ]; then
 fi
 yamlstr(){ jq -Rn --arg s "$1" '$s'; }   # single-line YAML-safe scalar (matches release-cm.sh)
 
-# Flat, path-safe, INJECTIVE folder name: sanitize unsafe chars, and when that changed anything
-# append a short hash of the RAW tag so two distinct tags can never collide into one folder.
+# Flat, path-safe folder name for a tag: sanitize unsafe chars, and when that changed anything
+# append a short hash of the RAW tag so a sanitized name stays distinct (practically
+# collision-free at repo-tag cardinality — CRC32, not a cryptographic guarantee). Also neutralize
+# `.`/`..` so a folder can never escape the repo dir (git forbids these in a real ref; belt-and-braces).
 tagsafe(){
   local raw safe
   raw="$1"; safe=$(printf '%s' "$raw" | sed 's#[^A-Za-z0-9._-]#_#g')
   [ "$safe" = "$raw" ] || safe="${safe}-$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+  case "$safe" in .|..) safe="_${safe}";; esac
   printf '%s' "$safe"
 }
 
+# Warn (never silently overwrite) if a DIFFERENT tag already owns this folder's release.yaml.
+warn_overwrite(){
+  local existing
+  [ -f "$1/release.yaml" ] || return 0
+  existing=$({ grep -E '^tag:' "$1/release.yaml" || true; } | head -1 | sed -E 's/^tag:[[:space:]]*//; s/^"//; s/"$//')
+  [ -n "$existing" ] && [ "$existing" != "$2" ] && \
+    echo "::warning::release-cm-audit: tags '$2' and '$existing' map to the same folder $(basename "$1") — overwriting" >&2
+  return 0
+}
+
 # Minimal release.yaml (report-mode gap + fallbacks): tag + a status label.
+# NOTE: release.yaml is a re-derived projection, not a hand-edit surface — every run overwrites it.
 write_status(){
   [ -n "$RUN" ] || return 0
-  local d; d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"
+  local d; d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"; warn_overwrite "$d" "$1"
   { printf 'tag: %s\n' "$(yamlstr "$1")"; printf 'assessmentStatus: %s\n' "$2"; } > "$d/release.yaml"
   return 0
 }
 
 # release.yaml (+ per-PR pr-<n>.yaml) parsed from a cm block: $2 is either a release-cm DRY output
-# or a covered release body — both carry a fenced ```yaml``` block. A pr-<n>.yaml the agent already
-# authored (richer: rationale/title) is kept, not overwritten.
+# or a covered release body — both carry a fenced ```yaml``` block whose first line is
+# `cm-attributes: v1`. A pr-<n>.yaml the agent already authored (richer: rationale/title) is kept.
+# NOTE: release.yaml is a re-derived projection, not a hand-edit surface — every run overwrites it.
 write_release(){
   [ -n "$RUN" ] || return 0
   local d blk ct im rk st cov f pn pim prk
-  d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"
-  blk=$(printf '%s\n' "$2" | awk '/```yaml/{f=1;next} f&&/^```/{exit} f{print}')
-  ct=$(printf  '%s\n' "$blk" | sed -nE 's/^changeType:[[:space:]]*([a-z]+).*/\1/p'  | head -1)
-  im=$(printf  '%s\n' "$blk" | sed -nE 's/^impact:[[:space:]]*([a-z-]+).*/\1/p'      | head -1)
-  rk=$(printf  '%s\n' "$blk" | sed -nE 's/^risk:[[:space:]]*([a-z]+).*/\1/p'         | head -1)
-  st=$(printf  '%s\n' "$blk" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1)
+  d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"; warn_overwrite "$d" "$1"
+  # Select the fenced yaml block that IS the CM block (first line `cm-attributes: v1`), not merely
+  # the first ```yaml``` in the body — a covered release's notes may carry an earlier yaml block.
+  blk=$(printf '%s\n' "$2" | awk '
+    /```yaml/ { cap=1; first=1; buf=""; ok=0; next }
+    cap && /^[[:space:]]*```/ { if (ok) { printf "%s", buf; exit } cap=0; next }
+    cap { if (first) { first=0; if ($0 ~ /^[[:space:]]*cm-attributes: v1[[:space:]]*$/) ok=1 } buf=buf $0 "\n" }')
+  ct=$({ printf  '%s\n' "$blk" | sed -nE 's/^changeType:[[:space:]]*([a-z]+).*/\1/p'  || true; } | head -1)
+  im=$({ printf  '%s\n' "$blk" | sed -nE 's/^impact:[[:space:]]*([a-z-]+).*/\1/p'      || true; } | head -1)
+  rk=$({ printf  '%s\n' "$blk" | sed -nE 's/^risk:[[:space:]]*([a-z]+).*/\1/p'         || true; } | head -1)
+  st=$({ printf  '%s\n' "$blk" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' || true; } | head -1)
   cov=$({ printf '%s\n' "$blk" | grep -E '^assessedCoverage:' || true; } | head -1 | sed -E 's/^assessedCoverage:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//')
   {
     printf 'tag: %s\n' "$(yamlstr "$1")"

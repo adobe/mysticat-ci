@@ -37,9 +37,24 @@ yget(){
   printf '%s' "$val"
 }
 baseurl(){ case "$1" in git.corp.adobe.com) echo "https://git.corp.adobe.com";; *) echo "https://github.com";; esac; }
-# Percent-encode the chars that would break a tag used as a URL path segment / markdown link
-# (monorepo & ref tags): space and % / # / ? / / in addition to a literal space.
-urlenc(){ local s="$1"; s=${s//\%/%25}; s=${s//\//%2F}; s=${s//' '/%20}; s=${s//\#/%23}; s=${s//\?/%3F}; printf '%s' "$s"; }
+# Percent-encode a value for a URL path segment: allowlist the RFC-3986 unreserved set and
+# encode every other byte, so no tag char (space, ), |, backtick, <, >, …) can break the link.
+urlenc(){
+  local s="$1" out="" i c
+  for (( i=0; i<${#s}; i++ )); do
+    c=${s:i:1}
+    case "$c" in [A-Za-z0-9._~-]) out+="$c";; *) out+=$(printf '%%%02X' "'$c");; esac
+  done
+  printf '%s' "$out"
+}
+# Backslash-escape the Markdown-active chars so an untrusted value used as link TEXT or a table
+# cell cannot forge a link or break the table. Backslash first, so we don't double-escape.
+mdesc(){
+  local s="$1"
+  s=${s//\\/\\\\}; s=${s//\`/\\\`}; s=${s//\|/\\|}
+  s=${s//\[/\\[}; s=${s//\]/\\]}; s=${s//(/\\(}; s=${s//)/\\)}; s=${s//</\\<}; s=${s//>/\\>}
+  printf '%s' "$s"
+}
 
 nrepos=0; nrel=0; npr=0
 for repodir in "$RUN"/*/; do
@@ -50,7 +65,7 @@ for repodir in "$RUN"/*/; do
   for reldir in "${repodir}"*/; do
     [ -f "${reldir}release.yaml" ] || continue
     nrel=$((nrel+1))
-    tag=$(yget "${reldir}release.yaml" tag)
+    tag=$(yget "${reldir}release.yaml" tag); tdisp=$(mdesc "$tag")  # tdisp = link/table-safe display form
     rct=$(yget "${reldir}release.yaml" changeType); rim=$(yget "${reldir}release.yaml" impact); rrk=$(yget "${reldir}release.yaml" risk)
     rst=$(yget "${reldir}release.yaml" assessmentStatus); rcov=$(yget "${reldir}release.yaml" coverage)
     [ -n "$rcov" ] || rcov=$(yget "${reldir}release.yaml" assessedCoverage)  # accept either field name
@@ -65,15 +80,15 @@ for repodir in "$RUN"/*/; do
       { echo "# PR #$n — $repo"; echo
         [ -n "$title" ] && echo "> $title" && echo
         echo "- GitHub PR: [$repo#$n]($base/$repo/pull/$n)"
-        echo "- Release: [$tag](./release.md) · [on GitHub]($relurl)"
+        echo "- Release: [$tdisp](./release.md) · [on GitHub]($relurl)"
         echo "- Repo: [repo.md](../repo.md)"
         echo; echo "| changeType | impact | risk |"; echo "|---|---|---|"; echo "| $ct | $im | $rk |"
         echo; echo "$rat"
       } > "${prf%.yaml}.md"
     done
 
-    { echo "# Release $tag — $repo"; echo
-      echo "- GitHub release: [$tag]($relurl)"
+    { echo "# Release $tdisp — $repo"; echo
+      echo "- GitHub release: [$tdisp]($relurl)"
       echo "- Repo: [repo.md](../repo.md) · Session: [README.md](../../README.md)"
       echo; echo "## Change Management (aggregate)"; echo '```yaml'
       echo "changeType: ${rct}"; echo "impact: ${rim}"; echo "risk: ${rrk}"
@@ -91,7 +106,7 @@ for repodir in "$RUN"/*/; do
     echo; echo "## Releases"; echo "| release | changeType | impact | risk | status |"; echo "|---|---|---|---|---|"
     for reldir in "${repodir}"*/; do [ -f "${reldir}release.yaml" ] || continue
       tag=$(yget "${reldir}release.yaml" tag); ts=$(basename "$reldir")
-      printf "| [%s](%s/release.md) | %s | %s | %s | %s |\n" "$tag" "$ts" \
+      printf "| [%s](%s/release.md) | %s | %s | %s | %s |\n" "$(mdesc "$tag")" "$ts" \
         "$(yget "${reldir}release.yaml" changeType)" "$(yget "${reldir}release.yaml" impact)" \
         "$(yget "${reldir}release.yaml" risk)" "$(yget "${reldir}release.yaml" assessmentStatus)"
     done
