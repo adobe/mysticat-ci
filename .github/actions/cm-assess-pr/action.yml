@@ -1,0 +1,18 @@
+name: cm-assess-pr
+description: >
+  Ensure a pull request targeting a deploy branch carries a machine-readable cm-assessment block,
+  so the release decoration (release-cm) has per-PR change-management info to aggregate. Writes a
+  baseline (standard / unnoticeable / minor) when none is present, escalated by the cmr:high-risk
+  label; idempotent — never overwrites an author/agent-authored block. Decoration only, no
+  ServiceNow API calls. Needs no checkout (reads/writes the PR via the GitHub API).
+runs:
+  using: composite
+  steps:
+    - name: Ensure PR cm-assessment block
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      # Reuses cm-assess-pr-auto.sh from the sibling action dir (whole repo checked out at the ref).
+      run: bash "$GITHUB_ACTION_PATH/../release-cm/cm-assess-pr-auto.sh" "$PR"

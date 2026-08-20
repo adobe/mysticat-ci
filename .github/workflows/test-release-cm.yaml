@@ -24,5 +24,7 @@ jobs:
         run: bash .github/actions/release-cm/test-release-cm-audit.sh
       - name: cm-assess-pr unit tests
         run: bash .github/actions/release-cm/test-cm-assess-pr.sh
+      - name: cm-assess-pr-auto unit tests
+        run: bash .github/actions/release-cm/test-cm-assess-pr-auto.sh
       - name: cmr-report unit tests
         run: bash .github/actions/release-cm/test-cmr-report.sh
