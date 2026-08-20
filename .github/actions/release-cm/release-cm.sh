@@ -228,8 +228,8 @@ for n in $pr_nums; do
   fi
 
   # Aggregate = max. Unassessed/unknown fields use the baseline so they never lower the rating;
-  # a conflicting PR contributes the highest severity any of its blocks claimed (ci/cr) so it is
-  # never under-rated while it waits for a human.
+  # a conflicting PR contributes the highest severity any of its blocks claimed (conf_im/conf_rk)
+  # so it is never under-rated while it waits for a human.
   ir=$(impact_rank "${pr_impact:-${conf_im:-unnoticeable}}"); [ "$ir" -gt "$agg_impact" ] && agg_impact=$ir
   rr=$(risk_rank "${pr_risk:-${conf_rk:-minor}}");            [ "$rr" -gt "$agg_risk" ]   && agg_risk=$rr
   # A PR is classified by its own nature (standard|normal); emergency is a deploy attribute

@@ -80,12 +80,12 @@ for repodir in "$RUN"/*/; do
       ct=$(yget "$prf" changeType); im=$(yget "$prf" impact); rk=$(yget "$prf" risk)
       title=$(yget "$prf" title); rat=$(yget "$prf" rationale)
       { echo "# PR #$n — $repo"; echo
-        [ -n "$title" ] && echo "> $title" && echo
+        [ -n "$title" ] && echo "> $(mdesc "$title")" && echo   # free text -> escape markdown-active chars
         echo "- GitHub PR: [$repo#$n]($base/$repo/pull/$n)"
         echo "- Release: [$tdisp](./release.md) · [on GitHub]($relurl)"
         echo "- Repo: [repo.md](../repo.md)"
         echo; echo "| changeType | impact | risk |"; echo "|---|---|---|"; echo "| $ct | $im | $rk |"
-        echo; echo "$rat"
+        echo; echo "$(mdesc "$rat")"
       } > "${prf%.yaml}.md"
     done
 

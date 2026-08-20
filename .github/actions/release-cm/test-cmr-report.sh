@@ -161,6 +161,16 @@ rel17="$R17/o__r/rel/release.md"
 { grep -qF 'releases/tag/caf%C3%A9' "$rel17" && ! grep -qF 'caf%E9' "$rel17"; } \
   && ok "T17 non-ASCII tag percent-encoded as UTF-8 bytes" || no "T17" "$(cat "$rel17")"
 
+# T18 hostile title/rationale free text is markdown-escaped in the PR page (no forged links)
+R18="$TMP/r18"; mkdir -p "$R18/o__r/v1"
+printf 'repo: o/r\n' > "$R18/o__r/repo.yaml"
+printf 'tag: v1\nchangeType: standard\nimpact: unnoticeable\nrisk: minor\nassessmentStatus: assessed\n' > "$R18/o__r/v1/release.yaml"
+printf 'pr: 9\ntitle: "click [here](https://evil)"\nimpact: unnoticeable\nrisk: minor\nrationale: "see [x](https://evil)"\n' > "$R18/o__r/v1/pr-9.yaml"
+bash "$SCRIPT" "$R18" >/dev/null 2>&1
+pr18="$R18/o__r/v1/pr-9.md"
+{ grep -qF 'click \[here\]\(https://evil\)' "$pr18" && ! grep -qF '[here](https://evil)' "$pr18"; } \
+  && ok "T18 hostile title/rationale escaped in PR page" || no "T18" "$(cat "$pr18")"
+
 echo
 echo "-------- $pass passed, $fail failed --------"
 [ "$fail" -eq 0 ]
