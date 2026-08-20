@@ -23,8 +23,8 @@ esac; done
 
 # Read one scalar for key $2 from yaml file $1. Trims whitespace; strips a *balanced*
 # surrounding quote pair (so a value merely ending in a quote is preserved); for an
-# unquoted value, drops a trailing ` # comment` — matching the release-cm.sh / cm-assess-pr.sh
-# parsers so the same data file renders and decorates identically.
+# unquoted value, drops a trailing ` # comment`. Same parsing rules as cm-assess-pr.sh's getv,
+# so a data file renders and decorates consistently.
 yget(){
   local raw val
   raw=$({ grep -iE "^[[:space:]]*$2:" "$1" 2>/dev/null || true; } | head -1)

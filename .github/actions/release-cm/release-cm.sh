@@ -179,8 +179,8 @@ for n in $pr_nums; do
       cap && /^[[:space:]]*risk:/       { if (rk=="") { s=$0; sub(/^[[:space:]]*risk:[[:space:]]*/,"",s);       sub(/[[:space:]#].*$/,"",s); rk=s } }
       cap && /^[[:space:]]*changeType:/ { if (ct=="") { s=$0; sub(/^[[:space:]]*changeType:[[:space:]]*/,"",s); sub(/[[:space:]#].*$/,"",s); ct=s } }')
     ndistinct=$({ printf '%s\n' "$sigs" | grep . || true; } | sort -u | wc -l | tr -d ' ')
-    nclosed=$({ printf '%s\n' "$sigs" | grep -c . || true; }); nclosed=${nclosed:-0}
-    nmarkers=$({ printf '%s\n' "$pr_body" | grep -cE '^[[:space:]]*cm-assessment: v1[[:space:]]*$' || true; }); nmarkers=${nmarkers:-0}
+    nclosed=$(printf '%s\n' "$sigs" | grep -c . || true); nclosed=${nclosed:-0}
+    nmarkers=$(printf '%s\n' "$pr_body" | grep -cE '^[[:space:]]*cm-assessment: v1[[:space:]]*$' || true); nmarkers=${nmarkers:-0}
     if [ "$nmarkers" -gt "$nclosed" ]; then
       # a marker without a closing fence (possibly hiding behind a well-formed sibling block)
       unparsed=1; flag=1; blk=""

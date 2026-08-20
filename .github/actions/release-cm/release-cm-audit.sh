@@ -120,6 +120,14 @@ write_release(){
   return 0
 }
 
+# assessmentStatus from a release-cm block ($1); a per-tag FAILED line + bookkeeping (uses the
+# loop-scoped tag/day/failed, as write_status/write_release use repodir).
+extract_status(){ printf '%s\n' "$1" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1; }
+fail_tag(){
+  echo "FAILED   $tag  $day  — $(printf '%s\n' "$1" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
+  failed=$((failed + 1)); write_status "$tag" failed
+}
+
 total=0; covered=0; gap=0; suggested=0; needsreview=0; fixed=0; failed=0
 echo "== release-cm-audit  repo=$REPO  since=$SINCE  mode=$MODE =="
 
@@ -139,32 +147,29 @@ while IFS=$'\t' read -r tag published; do
       ;;
     suggest)
       if out=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
-        st=$(printf '%s\n' "$out" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1)
+        st=$(extract_status "$out")
         echo "SUGGEST  $tag  $day  assessmentStatus=${st:-?}"
         printf '%s\n' "$out" | awk '/```yaml/{f=1;print "    "$0;next} f&&/^```/{print "    "$0;exit} f{print "    "$0}'
         suggested=$((suggested + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
         write_release "$tag" "$out"
       else
-        echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
-        failed=$((failed + 1)); write_status "$tag" failed
+        fail_tag "$out"
       fi
       ;;
     fix)
       # Capture the block from a DRY pass BEFORE the real edit — afterwards the live body already
       # carries the block and DRY would short-circuit on the idempotency guard (no block emitted).
       if dry=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
-        st=$(printf '%s\n' "$dry" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1)
+        st=$(extract_status "$dry")
         if out=$(REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
           echo "FIXED    $tag  $day  ${st:+assessmentStatus=$st}"
           fixed=$((fixed + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
           write_release "$tag" "$dry"
         else
-          echo "FAILED   $tag  $day  — $(printf '%s\n' "$out" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
-          failed=$((failed + 1)); write_status "$tag" failed
+          fail_tag "$out"
         fi
       else
-        echo "FAILED   $tag  $day  — $(printf '%s\n' "$dry" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
-        failed=$((failed + 1)); write_status "$tag" failed
+        fail_tag "$dry"
       fi
       ;;
   esac
