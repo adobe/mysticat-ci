@@ -158,7 +158,7 @@ run T7d v2
   && has 'impact: unknown' && has 'risk: unknown' && [ "$RC" -eq 0 ]; } \
   && ok "T7d partial conflict: aggregate kept, per-PR unknown" || no "T7d partial conflict" "$OUT"
 
-# ---------- T8 AI reviewer (MysticatBot) approval is NOT an independent human (SOC2) ----------
+# ---------- T8 AI reviewer (MysticatBot) approval is NOT an independent human (CM Standard) ----------
 # MysticatBot is a GitHub "User" (not a *[bot] login), so it must be caught by the hardcoded
 # denylist. approvedBy still lists it (transparency); independentlyApproved must be false.
 mkfix T8; printf 'fixes #801\n' > "$FIXROOT/T8/release-body.txt"; echo null > "$FIXROOT/T8/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T8/releases.txt"
@@ -413,7 +413,7 @@ run T39 v2
   && ok "T39 human+bot approve -> human wins, changeApprovedBy=[carol]" || no "T39 mix" "$OUT"
 
 # ---------- T40 no explicit approval, but a non-author human REVIEWED without objecting (COMMENTED) ----------
-# CM approval policy: absence of rejection = approval. With no approver/merger/human-publisher, the
+# CM no-objection approval policy: a review without a change-request is approval. With no approver/merger/human-publisher, the
 # commenter is the fallback CM approver of record (name resolved). Release must NOT be needs-review.
 mkfix T40; printf 'fixes #4001\n' > "$FIXROOT/T40/release-body.txt"; echo null > "$FIXROOT/T40/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T40/releases.txt"
 echo 'github-actions[bot]' > "$FIXROOT/T40/release-author.txt"       # bot publisher -> no explicit approver/merger/publisher
@@ -442,10 +442,83 @@ run T42 v2
 { has 'changeApprovedBy: ["@bob"]' && ! has 'dave' && [ "$RC" -eq 0 ]; } \
   && ok "T42 explicit approver present -> commenter not added (fallback only)" || no "T42 fallback-only" "$OUT"
 
+# ---------- T43 changes-requested THEN commented (same reviewer) -> unresolved rejection, NOT an approver ----------
+# A later COMMENTED review does not clear an outstanding CHANGES_REQUESTED, so this reviewer must not
+# be flipped into the CM approver (SoD fail: a rejecter recorded as sign-off).
+mkfix T43; printf 'fixes #4301\n' > "$FIXROOT/T43/release-body.txt"; echo null > "$FIXROOT/T43/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T43/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T43/release-author.txt"
+mkpr T43 4301 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"mulder"},"state":"CHANGES_REQUESTED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"mulder"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
+run T43 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && has 'no CM approver' && ! has '@mulder' && [ "$RC" -eq 0 ]; } \
+  && ok "T43 changes-requested-then-commented (unresolved rejection) is NOT an approver" || no "T43 rejecter-then-comment" "$OUT"
+
+# ---------- T44 one reviewer rejects, a DIFFERENT one gives a no-objection review -> commenter approves ----------
+mkfix T44; printf 'fixes #4401\n' > "$FIXROOT/T44/release-body.txt"; echo null > "$FIXROOT/T44/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T44/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T44/release-author.txt"
+mkpr T44 4401 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"eve"},"state":"CHANGES_REQUESTED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"mulder"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
+run T44 v2
+{ has 'changeApprovedBy: ["@mulder"]' && ! has 'assessmentStatus: needs-review' && ! has 'eve' && [ "$RC" -eq 0 ]; } \
+  && ok "T44 rejecter does not veto a different reviewer's no-objection (@login fallback)" || no "T44 mixed reviewers" "$OUT"
+
+# ---------- T45 a COMMENTED reviewer whose GitHub type is Bot is rejected on the tier-4 path ----------
+mkfix T45; printf 'fixes #4501\n' > "$FIXROOT/T45/release-body.txt"; echo null > "$FIXROOT/T45/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T45/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T45/release-author.txt"
+echo '{"type":"Bot","name":"Comment Bot"}' > "$FIXROOT/T45/user-svc-commenter.json"   # not *[bot], not denylisted, but type Bot
+mkpr T45 4501 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"svc-commenter"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+run T45 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && ! has 'Comment Bot' && [ "$RC" -eq 0 ]; } \
+  && ok "T45 type=Bot commenter dropped by the tier-4 type-check -> needs-review" || no "T45 bot commenter" "$OUT"
+
+# ---------- T46 commenters union across multiple PRs (tier-4) ----------
+mkfix T46; printf 'fixes #4601 and #4602\n' > "$FIXROOT/T46/release-body.txt"; echo null > "$FIXROOT/T46/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T46/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T46/release-author.txt"
+echo 'Fox Mulder' > "$FIXROOT/T46/user-mulder.txt"; echo 'Dana Scully' > "$FIXROOT/T46/user-scully.txt"
+mkpr T46 4601 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"mulder"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+mkpr T46 4602 bob "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"scully"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
+run T46 v2
+{ has 'changeApprovedBy: ["Fox Mulder", "Dana Scully"]' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T46 tier-4 commenters union across PRs" || no "T46 multi-PR commenter union" "$OUT"
+
+# ---------- T47 unresolvable/empty profile lookup is dropped (fail-CLOSED type check) ----------
+mkfix T47; printf 'fixes #4701\n' > "$FIXROOT/T47/release-body.txt"; echo null > "$FIXROOT/T47/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T47/releases.txt"
+echo 'ghost' > "$FIXROOT/T47/release-author.txt"      # publisher, not a known bot -> passes is_bot...
+echo '{}' > "$FIXROOT/T47/user-ghost.json"            # ...but the profile lookup yields no type (failed/garbled)
+mkpr T47 4701 alice "$(blk 'impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"
+run T47 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && ! has '@ghost' && [ "$RC" -eq 0 ]; } \
+  && ok "T47 empty/unresolvable profile dropped (fail-closed) -> needs-review" || no "T47 type fail-closed" "$OUT"
+
+# ---------- T48 approve THEN comment: the approval stands (verdict-aware, not demoted to fallback) ----------
+mkfix T48; printf 'fixes #4801\n' > "$FIXROOT/T48/release-body.txt"; echo null > "$FIXROOT/T48/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T48/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T48/release-author.txt"
+mkpr T48 4801 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"bob"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
+run T48 v2
+{ has 'approvalControl: human' && has 'independentlyApproved: true' && has 'changeApprovedBy: ["@bob"]' && [ "$RC" -eq 0 ]; } \
+  && ok "T48 approve-then-comment keeps the approval (verdict-aware)" || no "T48 approve-then-comment" "$OUT"
+
+# ---------- T49 a commenter who authored a SIBLING PR in the release is excluded ----------
+mkfix T49; printf 'fixes #4901 and #4902\n' > "$FIXROOT/T49/release-body.txt"; echo null > "$FIXROOT/T49/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T49/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T49/release-author.txt"
+mkpr T49 4901 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"bob"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"   # bob comments on #4901
+mkpr T49 4902 bob "$(blk 'impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"                                                                                # ...but bob authored #4902
+run T49 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && [ "$RC" -eq 0 ]; } \
+  && ok "T49 commenter who authored a sibling PR is excluded -> needs-review" || no "T49 commenter sibling-author" "$OUT"
+
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"
 run T32 v2; { yaml_ok; } && ok "YAML valid (T32 empty changeApprovedBy)" || no "YAML valid (T32)" "$OUT"
+run T40 v2; { yaml_ok; } && ok "YAML valid (T40 tier-4 commenter approver)" || no "YAML valid (T40)" "$OUT"
 
 echo
 echo "-------- $pass passed, $fail failed --------"

@@ -11,6 +11,7 @@ FIX="$TMP/fix"; mkdir -p "$TMP/bin" "$FIX"; export FIX
 cat > "$TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 FIX="${FIX:?}"
+if [ "$1" = "api" ] && [ "${2#users/}" != "$2" ]; then jq -n '{type:"User",name:""}'; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then exit 0; fi
 if [ "$1" = "release" ] && [ "$2" = "list" ]; then
   jq -Rn '[inputs|select(length>0)|split("\t")|{tagName:.[0],publishedAt:.[1],isDraft:(.[2]=="draft"),isPrerelease:(.[2]=="pre")}]' < "$FIX/releases.tsv"
@@ -121,6 +122,7 @@ BIN2="$TMP/bin2"; F2="$TMP/fix2"; mkdir -p "$BIN2" "$F2"
 cat > "$BIN2/gh" <<'SH'
 #!/usr/bin/env bash
 FIX="${FIX:?}"
+if [ "$1" = "api" ] && [ "${2#users/}" != "$2" ]; then jq -n '{type:"User",name:""}'; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then exit 0; fi
 if [ "$1" = "release" ] && [ "$2" = "list" ]; then
   jq -Rn '[inputs|select(length>0)|split("\t")|{tagName:.[0],publishedAt:.[1],isDraft:false,isPrerelease:false}]' < "$FIX/releases.tsv"; exit 0

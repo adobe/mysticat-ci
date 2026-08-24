@@ -199,8 +199,11 @@ for n in $pr_nums; do
   # transparency. `independentlyApproved`/`approvalControl` describe that review approval.
   # `pr_ca` = this PR's CM change-approver(s): the HUMAN review-approvers other than the author
   # (a bot/AI approval is NOT a CM approver). These feed the release-level changeApprovedBy.
+  # Effective verdict per reviewer = their latest APPROVED/CHANGES_REQUESTED review (a later COMMENTED
+  # does NOT clear an approval or a change-request — GitHub keeps the verdict until re-reviewed). An
+  # approver is a reviewer whose effective verdict is APPROVED.
   approvers=$(printf '%s' "$pr_json" | jq -r \
-    '[.reviews[]|select(.author.login!=null)]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="APPROVED"))|.[].author.login' \
+    '[.reviews[]|select(.author.login!=null and (.state=="APPROVED" or .state=="CHANGES_REQUESTED"))]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="APPROVED"))|.[].author.login' \
     2>/dev/null || true)
   approved_arr="[]"; independent=false; pr_ca=""
   if [ -n "$approvers" ]; then
@@ -218,12 +221,15 @@ for n in $pr_nums; do
     approved_arr="[${arr}]"
   fi
 
-  # CM approval policy — absence of rejection = approval. A non-author human whose LATEST review is
-  # COMMENTED (they looked and did NOT request changes) is the required second pair of eyes. Collected
-  # release-wide and used as the FALLBACK changeApprovedBy only when nobody explicitly approved /
-  # merged / published. A latest CHANGES_REQUESTED review is a rejection and is never collected here.
-  commenters=$(printf '%s' "$pr_json" | jq -r \
-    '[.reviews[]|select(.author.login!=null)]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="COMMENTED"))|.[].author.login' \
+  # CM approval policy — a change reviewed by a non-author human who did not request changes is
+  # approved (an explicit "Approve" is not required). The fallback second pair of eyes is a reviewer
+  # who left a COMMENTED review and NEVER gave a verdict (never APPROVED — that is tier 1 — and never
+  # CHANGES_REQUESTED). Anyone with a CHANGES_REQUESTED review is a rejecter and is excluded here even
+  # if they later only commented: a COMMENTED review does not clear an outstanding change-request.
+  commenters=$(printf '%s' "$pr_json" | jq -r '
+    [.reviews[]|select(.author.login!=null)] as $all
+    | ($all|map(select(.state=="APPROVED" or .state=="CHANGES_REQUESTED"))|map(.author.login)) as $verdict
+    | (($all|map(select(.state=="COMMENTED"))|map(.author.login)|unique) - $verdict) | .[]' \
     2>/dev/null || true)
   if [ -n "$commenters" ]; then
     while IFS= read -r rev; do
@@ -351,7 +357,7 @@ ${changes}"; fi
 # first non-empty tier wins, each candidate verified to be a real person (GitHub account type `User`,
 # a fail-safe beyond BOT_IDENTITIES for app/service bots):
 #   1-3. a non-author human who review-APPROVED a PR, MERGED one, or PUBLISHED/deployed the release;
-#   4.   else (approval policy: absence of rejection = approval) a non-author human who REVIEWED a PR
+#   4.   else (no-objection approval policy: a review without a change-request is approval) a human who REVIEWED a PR
 #        without requesting changes — a COMMENTED review, the required second pair of eyes of record.
 # A CHANGES_REQUESTED review is a rejection and never qualifies. Distinct from the GitHub "PR
 # approval" (`approvedBy`). None derivable + the release carries changes => needs-review +
@@ -361,22 +367,24 @@ authors_uniq=$(dedup "$authors_seen")
 not_author() { ! printf '%s\n' "$authors_uniq" | grep -qxF -- "$1"; }
 pick_humans() { local lg; while IFS= read -r lg; do [ -n "$lg" ] || continue; if not_author "$lg"; then printf '%s\n' "$lg"; fi; done <<<"$(dedup "$1")"; }
 
-change_approvers=""; arr=""
-# Resolve a newline-delimited candidate list into changeApprovedBy: drop contributing authors, drop
-# anyone GitHub reports as not a `User` (app/service/org bots — fail-safe past BOT_IDENTITIES), and
-# record each remaining person once as their NAME (login fallback). Appends to change_approvers/arr.
+change_approvers=""; ca_arr=""
+# Resolve a newline-delimited candidate list into changeApprovedBy: drop contributing authors, keep
+# ONLY accounts GitHub confirms are a real person (type `User` — a fail-safe past BOT_IDENTITIES for
+# app/service/org bots), and record each once as their NAME (login fallback). The type check is
+# fail-CLOSED: a non-`User` type, or a failed/empty profile lookup, drops the candidate (so it cannot
+# silently become a spurious approver — an emptied set => needs-review). Appends to change_approvers/ca_arr.
 resolve_approvers() {
   local lg uj nm disp
   while IFS= read -r lg; do
     [ -n "$lg" ] || continue
     if printf '%s\n' "$change_approvers" | grep -qxF -- "$lg"; then continue; fi   # already recorded
     uj=$(gh api "users/$lg" 2>/dev/null || echo '{}')
-    case "$(printf '%s' "$uj" | jq -r '.type // ""' 2>/dev/null)" in Bot|Organization|Mannequin) continue;; esac
+    case "$(printf '%s' "$uj" | jq -r '.type // ""' 2>/dev/null)" in User) ;; *) continue;; esac
     nm=$(printf '%s' "$uj" | jq -r '.name // ""' 2>/dev/null || true)
     case "$nm" in ""|null) disp="@$lg";; *) disp="$nm";; esac
     change_approvers="${change_approvers}${lg}
 "
-    arr="${arr:+$arr, }$(yamlstr "$disp")"
+    ca_arr="${ca_arr:+$ca_arr, }$(yamlstr "$disp")"
   done <<<"$(pick_humans "$1")"
 }
 
@@ -400,7 +408,7 @@ if [ -z "$change_approvers" ]; then
     log_warn "release $TAG: no CM approver (a non-author human who approved / merged / published, or reviewed without requesting changes) could be derived — assessmentStatus=needs-review; record the sign-off (e.g. Slack approval / manager attestation)"
   fi
 else
-  change_approved_yaml="[${arr}]"
+  change_approved_yaml="[${ca_arr}]"
 fi
 
 # No PR seen at all: fall back to the §3.1.1 baseline (unnoticeable / minor).
