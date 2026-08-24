@@ -55,10 +55,11 @@
 #   account type is not `User` (catches app/service bots). Everyone else is a human.
 #   PER PR: approvalControl = human|automated|none (the review-approval control; `automated` = an
 #   AI/policy approver ran, not a skip). changeApprovedBy = the human review-approvers ≠ author.
-#   PER RELEASE: changeApprovedBy resolves down a ladder (first non-empty wins): a non-author human
-#   who review-approved a PR ∪ merged one ∪ published/deployed the release; else, as the last-resort
-#   fallback, a non-author human who reviewed a PR without requesting changes (a COMMENTED review).
-#   All minus authors, type-verified. If none and the release has changes => assessmentStatus:
+#   PER RELEASE: changeApprovedBy = the union of non-author humans who review-approved a PR ∪ merged
+#   one ∪ published/deployed the release; else, as the last-resort fallback, a non-author human who
+#   was SHOWN the change and did not object — a requested/assigned reviewer, or a COMMENTED review
+#   (a CHANGES_REQUESTED verdict is a rejection and is excluded). All minus authors, type-verified.
+#   The fallback empty too => the change went solo, no second pair of eyes => assessmentStatus:
 #   needs-review + changeApprovedBy: [] so a human records the out-of-band sign-off (e.g. a Slack
 #   approval). The value is the person's NAME (login fallback).
 #   Full write-up: mysticat-architecture platform/decisions/release-cm-attributes-mitigation.md.
@@ -171,11 +172,12 @@ n_refs=$(printf '%s' "$pr_nums" | wc -w | tr -d ' ')
 changes=""; high_risk=""; n_changes=0; n_assessed=0; n_unknown=0; needs_review=""
 agg_impact=-1; agg_risk=-1; agg_ctype=0   # -1 = no PR seen yet; per-PR baseline applied below
 # Release-wide CM-approver signals (newline-delimited logins), resolved into changeApprovedBy below.
-# human_commenters is the fallback tier: non-author humans who reviewed without requesting changes.
-authors_seen=""; human_approvers=""; human_mergers=""; human_commenters=""
+# human_noobjection is the fallback tier: non-author humans shown the change (requested/assigned as a
+# reviewer, or who left a COMMENTED review) who did not object.
+authors_seen=""; human_approvers=""; human_mergers=""; human_noobjection=""
 for n in $pr_nums; do
   errf=$(mktemp)
-  if ! pr_json=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews,body,mergedBy 2>"$errf"); then
+  if ! pr_json=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews,body,mergedBy,reviewRequests 2>"$errf"); then
     if grep -qiE 'Could not resolve to (a |an )?(PullRequest|Issue)|no pull requests found|not found' "$errf"; then
       rm -f "$errf"; continue                       # a #NNN that is an issue, not a PR — skip
     fi
@@ -221,22 +223,26 @@ for n in $pr_nums; do
     approved_arr="[${arr}]"
   fi
 
-  # CM approval policy — a change reviewed by a non-author human who did not request changes is
-  # approved (an explicit "Approve" is not required). The fallback second pair of eyes is a reviewer
-  # who left a COMMENTED review and NEVER gave a verdict (never APPROVED — that is tier 1 — and never
-  # CHANGES_REQUESTED). Anyone with a CHANGES_REQUESTED review is a rejecter and is excluded here even
-  # if they later only commented: a COMMENTED review does not clear an outstanding change-request.
-  commenters=$(printf '%s' "$pr_json" | jq -r '
-    [.reviews[]|select(.author.login!=null)] as $all
+  # CM no-objection approval policy — the control's job is to ensure a change was shown to a second
+  # pair of eyes who did not object, so that only a change an author rushed to prod entirely solo is
+  # flagged. The fallback approver is therefore a non-author human who was SHOWN the change and did
+  # not object: a requested/assigned reviewer, OR someone who left a COMMENTED review — provided they
+  # NEVER gave a verdict of their own. An APPROVED verdict is tier 1; a CHANGES_REQUESTED verdict is a
+  # rejecter (an outstanding change-request that a later comment does not clear) and is excluded here.
+  # (In this org, a listed reviewer who does not object is understood to agree.)
+  noobjectors=$(printf '%s' "$pr_json" | jq -r '
+    [.reviews[]?|select(.author.login!=null)] as $all
     | ($all|map(select(.state=="APPROVED" or .state=="CHANGES_REQUESTED"))|map(.author.login)) as $verdict
-    | (($all|map(select(.state=="COMMENTED"))|map(.author.login)|unique) - $verdict) | .[]' \
+    | ($all|map(select(.state=="COMMENTED"))|map(.author.login)) as $commented
+    | [.reviewRequests[]?|.login // empty] as $requested
+    | ((($commented + $requested)|unique) - $verdict) | .[]' \
     2>/dev/null || true)
-  if [ -n "$commenters" ]; then
+  if [ -n "$noobjectors" ]; then
     while IFS= read -r rev; do
       [ -n "$rev" ] || continue
-      if [ "$rev" != "$a" ] && ! is_bot "$rev"; then human_commenters="${human_commenters}${rev}
+      if [ "$rev" != "$a" ] && ! is_bot "$rev"; then human_noobjection="${human_noobjection}${rev}
 "; fi
-    done <<<"$commenters"
+    done <<<"$noobjectors"
   fi
 
   # PR cm-assessment block. A single block (or several that AGREE on the gating fields) is used;
@@ -357,8 +363,8 @@ ${changes}"; fi
 # first non-empty tier wins, each candidate verified to be a real person (GitHub account type `User`,
 # a fail-safe beyond BOT_IDENTITIES for app/service bots):
 #   1-3. a non-author human who review-APPROVED a PR, MERGED one, or PUBLISHED/deployed the release;
-#   4.   else (no-objection approval policy: a review without a change-request is approval) a human who REVIEWED a PR
-#        without requesting changes — a COMMENTED review, the required second pair of eyes of record.
+#   4.   else (no-objection policy) a non-author human who was SHOWN the change and did not object — a
+#        requested/assigned reviewer or a COMMENTED review — the required second pair of eyes of record.
 # A CHANGES_REQUESTED review is a rejection and never qualifies. Distinct from the GitHub "PR
 # approval" (`approvedBy`). None derivable + the release carries changes => needs-review +
 # `changeApprovedBy: []` so a human records the out-of-band sign-off.
@@ -396,8 +402,9 @@ if [ -n "$release_author" ] && ! is_bot "$release_author"; then ca_cand="${ca_ca
 ${release_author}"; fi
 resolve_approvers "$ca_cand"
 # Tier 4 fallback: nobody explicitly approved/merged/published — accept the second pair of eyes, a
-# non-author human who reviewed a PR without requesting changes (COMMENTED). Only when 1-3 are empty.
-if [ -z "$change_approvers" ] && [ -n "$human_commenters" ]; then resolve_approvers "$human_commenters"; fi
+# non-author human who was shown the change (requested/assigned reviewer, or a COMMENTED review) and
+# did not object. Only when tiers 1-3 are empty. Empty here too => the change went solo => needs-review.
+if [ -z "$change_approvers" ] && [ -n "$human_noobjection" ]; then resolve_approvers "$human_noobjection"; fi
 
 if [ -z "$change_approvers" ]; then
   change_approved_yaml="[]"
@@ -405,7 +412,7 @@ if [ -z "$change_approvers" ]; then
   # needs-review so a human records the out-of-band sign-off. A no-change release stays as-is.
   if [ "$n_changes" -gt 0 ]; then
     needs_review=1
-    log_warn "release $TAG: no CM approver (a non-author human who approved / merged / published, or reviewed without requesting changes) could be derived — assessmentStatus=needs-review; record the sign-off (e.g. Slack approval / manager attestation)"
+    log_warn "release $TAG: no CM approver (a non-author human who approved / merged / published, or was assigned as a reviewer / reviewed without requesting changes) could be derived — the change reached prod with no second pair of eyes; assessmentStatus=needs-review; record the sign-off (e.g. Slack approval / manager attestation)"
   fi
 else
   change_approved_yaml="[${ca_arr}]"

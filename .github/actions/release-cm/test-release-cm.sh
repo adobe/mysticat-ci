@@ -514,11 +514,29 @@ run T49 v2
 { has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && [ "$RC" -eq 0 ]; } \
   && ok "T49 commenter who authored a sibling PR is excluded -> needs-review" || no "T49 commenter sibling-author" "$OUT"
 
+# ---------- T50 a requested/assigned reviewer who left NO review is the no-objection approver ----------
+# The change was shown to a non-author human who did not object -> not a solo rush -> not needs-review.
+mkfix T50; printf 'fixes #5001\n' > "$FIXROOT/T50/release-body.txt"; echo null > "$FIXROOT/T50/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T50/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T50/release-author.txt"; echo 'Walter Skinner' > "$FIXROOT/T50/user-skinner.txt"
+jq -n --arg a alice '{author:{login:$a},labels:[],reviews:[],mergedBy:null,body:"## Change Management\n\n```yaml\ncm-assessment: v1\nimpact: unnoticeable\nrisk: minor\n```\n",reviewRequests:[{"__typename":"User",login:"skinner"}]}' > "$FIXROOT/T50/pr-5001.json"
+run T50 v2
+{ has 'changeApprovedBy: ["Walter Skinner"]' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T50 assigned/requested reviewer (no submitted review) is the no-objection approver" || no "T50 requested reviewer" "$OUT"
+
+# ---------- T51 a BOT requested reviewer does NOT satisfy the second pair of eyes -> needs-review ----------
+mkfix T51; printf 'fixes #5101\n' > "$FIXROOT/T51/release-body.txt"; echo null > "$FIXROOT/T51/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T51/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T51/release-author.txt"
+jq -n --arg a alice '{author:{login:$a},labels:[],reviews:[],mergedBy:null,body:"## Change Management\n\n```yaml\ncm-assessment: v1\nimpact: unnoticeable\nrisk: minor\n```\n",reviewRequests:[{"__typename":"User",login:"MysticatBot"}]}' > "$FIXROOT/T51/pr-5101.json"
+run T51 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && has 'no second pair of eyes' && ! has 'MysticatBot' && [ "$RC" -eq 0 ]; } \
+  && ok "T51 bot requested reviewer is not a second pair of eyes -> needs-review" || no "T51 bot requested reviewer" "$OUT"
+
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"
 run T32 v2; { yaml_ok; } && ok "YAML valid (T32 empty changeApprovedBy)" || no "YAML valid (T32)" "$OUT"
 run T40 v2; { yaml_ok; } && ok "YAML valid (T40 tier-4 commenter approver)" || no "YAML valid (T40)" "$OUT"
+run T50 v2; { yaml_ok; } && ok "YAML valid (T50 requested-reviewer approver)" || no "YAML valid (T50)" "$OUT"
 
 echo
 echo "-------- $pass passed, $fail failed --------"
