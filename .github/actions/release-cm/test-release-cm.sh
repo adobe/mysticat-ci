@@ -23,8 +23,11 @@ if [ "$1" = "release" ] && [ "$2" = "view" ]; then
                    cat "$FIX/release-body.txt" 2>/dev/null || echo ""; exit 0;;
   esac
 fi
-if [ "$1" = "api" ] && [ "${2#users/}" != "$2" ]; then   # users/<login> name lookup (best-effort)
-  cat "$FIX/user-${2#users/}.txt" 2>/dev/null || echo ""; exit 0
+if [ "$1" = "api" ] && [ "${2#users/}" != "$2" ]; then   # users/<login> profile lookup -> JSON
+  login="${2#users/}"
+  if [ -f "$FIX/user-$login.json" ]; then cat "$FIX/user-$login.json"
+  else nm=$(cat "$FIX/user-$login.txt" 2>/dev/null || echo ""); jq -n --arg n "$nm" '{type:"User",name:$n}'; fi
+  exit 0
 fi
 if [ "$1" = "release" ] && [ "$2" = "edit" ]; then
   [ -f "$FIX/release-edit-fail" ] && { echo "HTTP 403" >&2; exit 1; }
@@ -343,26 +346,26 @@ echo 'github-actions[bot]' > "$FIXROOT/T32/release-author.txt"
 mkpr T32 3201 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"MysticatBot"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T32 v2
-{ has 'assessmentStatus: needs-review' && has 'no human approver could be derived' && has 'approvedBy: []' && [ "$RC" -eq 0 ]; } \
-  && ok "T32 all-automation -> needs a human approver" || no "T32 all-automation" "$OUT"
+{ has 'assessmentStatus: needs-review' && has 'no CM approver' && has 'changeApprovedBy: []' && [ "$RC" -eq 0 ]; } \
+  && ok "T32 all-automation -> needs a CM approver" || no "T32 all-automation" "$OUT"
 
-# ---------- T33 human PR approver -> listed as the release approver (name resolved) ----------
+# ---------- T33 human PR approver -> release CM approver (name resolved); PR carries changeApprovedBy ----------
 mkfix T33; printf 'fixes #3301\n' > "$FIXROOT/T33/release-body.txt"; echo null > "$FIXROOT/T33/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T33/releases.txt"
-echo 'github-actions[bot]' > "$FIXROOT/T33/release-author.txt"     # publisher is a bot -> approver must come from the human reviewer
+echo 'github-actions[bot]' > "$FIXROOT/T33/release-author.txt"     # publisher is a bot -> CM approver must come from the human reviewer
 echo 'Dana Scully' > "$FIXROOT/T33/user-dana.txt"
 mkpr T33 3301 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"dana"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T33 v2
-{ has 'approvedBy: ["Dana Scully"]' && has 'approvalControl: human' && ! has 'no human approver' && [ "$RC" -eq 0 ]; } \
-  && ok "T33 human PR approver is the release approver (approvalControl: human)" || no "T33 human PR approver" "$OUT"
+{ has 'changeApprovedBy: ["Dana Scully"]' && has 'changeApprovedBy: ["dana"]' && has 'approvalControl: human' && ! has 'no CM approver' && [ "$RC" -eq 0 ]; } \
+  && ok "T33 human PR approver -> release + per-PR changeApprovedBy" || no "T33 human PR approver" "$OUT"
 
-# ---------- T34 no reviewer, bot publisher, human merger -> merger is the approver ----------
+# ---------- T34 no reviewer, bot publisher, human merger -> merger is the CM approver ----------
 mkfix T34; printf 'fixes #3401\n' > "$FIXROOT/T34/release-body.txt"; echo null > "$FIXROOT/T34/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T34/releases.txt"
 echo 'github-actions[bot]' > "$FIXROOT/T34/release-author.txt"
 jq -n --arg a alice --arg m erin '{author:{login:$a},labels:[],reviews:[],body:"x",mergedBy:{login:$m}}' > "$FIXROOT/T34/pr-3401.json"
 run T34 v2
-{ has 'approvedBy: ["@erin"]' && ! has 'no human approver' && [ "$RC" -eq 0 ]; } \
-  && ok "T34 human merger is the release approver" || no "T34 human merger" "$OUT"
+{ has 'changeApprovedBy: ["@erin"]' && ! has 'no CM approver' && [ "$RC" -eq 0 ]; } \
+  && ok "T34 human merger is the release CM approver" || no "T34 human merger" "$OUT"
 
 # ---------- T35 release published by the change author -> not a valid approver -> needs-review ----------
 mkfix T35; printf 'fixes #3501\n' > "$FIXROOT/T35/release-body.txt"; echo null > "$FIXROOT/T35/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T35/releases.txt"
@@ -370,13 +373,49 @@ echo 'alice' > "$FIXROOT/T35/release-author.txt"                   # same person
 mkpr T35 3501 alice "$(blk 'impact: unnoticeable
 risk: minor')" "$NOREV" "$NOLBL"
 run T35 v2
-{ has 'assessmentStatus: needs-review' && has 'no human approver' && [ "$RC" -eq 0 ]; } \
+{ has 'assessmentStatus: needs-review' && has 'no CM approver' && [ "$RC" -eq 0 ]; } \
   && ok "T35 author-as-publisher is not an approver -> needs-review" || no "T35 author self-approval" "$OUT"
+
+# ---------- T36 non-[bot] account whose GitHub type is Bot is NOT a CM approver (denylist fail-open fix) ----------
+mkfix T36; printf 'fixes #3601\n' > "$FIXROOT/T36/release-body.txt"; echo null > "$FIXROOT/T36/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T36/releases.txt"
+echo 'svc-release' > "$FIXROOT/T36/release-author.txt"             # not *[bot], not in denylist -> passes is_bot...
+echo '{"type":"Bot","name":"Release Service"}' > "$FIXROOT/T36/user-svc-release.json"  # ...but GitHub type is Bot
+mkpr T36 3601 alice "$(blk 'impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"
+run T36 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && ! has 'Release Service' && [ "$RC" -eq 0 ]; } \
+  && ok "T36 type=Bot publisher rejected -> needs-review" || no "T36 type-check fail-open fix" "$OUT"
+
+# ---------- T37 union: a human PR approver AND a human publisher are BOTH listed ----------
+mkfix T37; printf 'fixes #3701\n' > "$FIXROOT/T37/release-body.txt"; echo null > "$FIXROOT/T37/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T37/releases.txt"
+echo 'relmgr' > "$FIXROOT/T37/release-author.txt"
+mkpr T37 3701 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+run T37 v2
+{ has 'changeApprovedBy: ["@bob", "@relmgr"]' && [ "$RC" -eq 0 ]; } \
+  && ok "T37 release changeApprovedBy is the union (reviewer + publisher)" || no "T37 union" "$OUT"
+
+# ---------- T38 multi-PR/multi-author: a reviewer who authored a SIBLING PR is excluded ----------
+mkfix T38; printf 'fixes #3801 and #3802\n' > "$FIXROOT/T38/release-body.txt"; echo null > "$FIXROOT/T38/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T38/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T38/release-author.txt"
+mkpr T38 3801 alice 'x' '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"  # bob approves PR#3801
+mkpr T38 3802 bob 'y' "$NOREV" "$NOLBL"                                                                                 # ...but bob authored PR#3802
+run T38 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && [ "$RC" -eq 0 ]; } \
+  && ok "T38 sibling-PR author excluded as release approver -> needs-review" || no "T38 multi-author exclusion" "$OUT"
+
+# ---------- T39 MIX: human + bot both APPROVE one PR -> approvalControl human, changeApprovedBy = human ----------
+mkfix T39; printf 'fixes #3901\n' > "$FIXROOT/T39/release-body.txt"; echo null > "$FIXROOT/T39/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T39/releases.txt"
+mkpr T39 3901 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"MysticatBot"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"carol"},"state":"APPROVED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
+run T39 v2
+{ has 'approvalControl: human' && has 'changeApprovedBy: ["carol"]' && [ "$RC" -eq 0 ]; } \
+  && ok "T39 human+bot approve -> human wins, changeApprovedBy=[carol]" || no "T39 mix" "$OUT"
 
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"
-run T32 v2; { yaml_ok; } && ok "YAML valid (T32 empty approvedBy)" || no "YAML valid (T32)" "$OUT"
+run T32 v2; { yaml_ok; } && ok "YAML valid (T32 empty changeApprovedBy)" || no "YAML valid (T32)" "$OUT"
 
 echo
 echo "-------- $pass passed, $fail failed --------"

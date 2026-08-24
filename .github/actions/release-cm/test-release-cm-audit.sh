@@ -66,9 +66,10 @@ runa 2026-01-01 report
 # ---- suggest ----
 runa 2026-01-01 suggest
 { has 'SUGGEST  v1.1.0' && has 'assessmentStatus=assessed' && has 'impact: degradation' \
+  && has 'changeApprovedBy:' \
   && has 'SUGGEST  v1.2.0' && has 'assessmentStatus=unassessed' \
   && has 'suggested 2' && [ "$RC" -eq 0 ]; } \
-  && ok "suggest shows blocks + status, no writes" || no "suggest" "$OUT"
+  && ok "suggest shows blocks + status (incl. changeApprovedBy), no writes" || no "suggest" "$OUT"
 
 # ---- fix ----
 runa 2026-01-01 fix
