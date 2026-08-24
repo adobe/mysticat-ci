@@ -43,21 +43,24 @@
 # release is cut) is preserved. To override a PR's assessment, EDIT its block in place —
 # appending a second, disagreeing block does not silently win; it resolves to needs-review.
 #
-# Approval-flow tracking (CM Standard / SOC2). Two distinct terms, deliberately separated:
+# Approval-flow tracking (CM Standard). Two distinct terms, deliberately separated:
 #   * `approvedBy` (per-PR) = the GitHub PR *review* approval (who clicked Approve; human or bot).
 #   * `changeApprovedBy` (per-PR + release) = the CM *change approver*: a person who did NOT author
-#     the change and agreed to ship it — a human who review-approved, merged, or published/deployed.
-#     A reviewer who only looked without objecting is NOT a changeApprovedBy.
+#     the change and did not reject it. Under our CM approval policy an explicit "Approve" click is
+#     NOT required — a second pair of eyes that reviewed and did not request changes IS approval;
+#     only a CHANGES_REQUESTED review is a rejection. (See the decision doc for the policy rationale.)
 #   Human vs automation: BOT_IDENTITIES (below) — `*[bot]` (case-insensitive) + a hardcoded set of
 #   AI/CI/merge accounts (MysticatBot is a GitHub *User*, listed explicitly); extend via env. As a
 #   fail-safe past the list, a release-level changeApprovedBy candidate is also dropped if the GitHub
 #   account type is not `User` (catches app/service bots). Everyone else is a human.
 #   PER PR: approvalControl = human|automated|none (the review-approval control; `automated` = an
 #   AI/policy approver ran, not a skip). changeApprovedBy = the human review-approvers ≠ author.
-#   PER RELEASE: changeApprovedBy = the UNION of the change approvers (human review-approvers ∪
-#   mergers ∪ publisher/deployer), minus authors, type-verified. If none and the release has changes
-#   => assessmentStatus: needs-review + changeApprovedBy: [] so a human records the out-of-band
-#   sign-off (e.g. a Slack approval). The value is the person's NAME (login fallback).
+#   PER RELEASE: changeApprovedBy resolves down a ladder (first non-empty wins): a non-author human
+#   who review-approved a PR ∪ merged one ∪ published/deployed the release; else, as the last-resort
+#   fallback, a non-author human who reviewed a PR without requesting changes (a COMMENTED review).
+#   All minus authors, type-verified. If none and the release has changes => assessmentStatus:
+#   needs-review + changeApprovedBy: [] so a human records the out-of-band sign-off (e.g. a Slack
+#   approval). The value is the person's NAME (login fallback).
 #   Full write-up: mysticat-architecture platform/decisions/release-cm-attributes-mitigation.md.
 #
 # Idempotent. Decoration only — no ServiceNow API calls.
@@ -75,7 +78,7 @@ yamlstr()  { jq -Rn --arg s "$1" '$s'; }   # encode arbitrary text as a valid (q
 errf=""; trap 'rm -f "${errf:-}"' EXIT
 
 # Automation identities that do NOT count as a human approver. The CM Standard's human-approver
-# requirement (SOC2) is satisfied only by a login that is NOT one of these. A `*[bot]` login is
+# requirement is satisfied only by a login that is NOT one of these. A `*[bot]` login is
 # always automation; the rest are a hardcoded, known set (AI reviewers, CI, mergers) extendable
 # via the BOT_IDENTITIES env (one login per line). Matched case-insensitively, whole-login.
 BOT_IDENTITIES="${BOT_IDENTITIES:-}
@@ -168,7 +171,8 @@ n_refs=$(printf '%s' "$pr_nums" | wc -w | tr -d ' ')
 changes=""; high_risk=""; n_changes=0; n_assessed=0; n_unknown=0; needs_review=""
 agg_impact=-1; agg_risk=-1; agg_ctype=0   # -1 = no PR seen yet; per-PR baseline applied below
 # Release-wide CM-approver signals (newline-delimited logins), resolved into changeApprovedBy below.
-authors_seen=""; human_approvers=""; human_mergers=""
+# human_commenters is the fallback tier: non-author humans who reviewed without requesting changes.
+authors_seen=""; human_approvers=""; human_mergers=""; human_commenters=""
 for n in $pr_nums; do
   errf=$(mktemp)
   if ! pr_json=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews,body,mergedBy 2>"$errf"); then
@@ -212,6 +216,21 @@ for n in $pr_nums; do
       fi
     done <<<"$approvers"
     approved_arr="[${arr}]"
+  fi
+
+  # CM approval policy — absence of rejection = approval. A non-author human whose LATEST review is
+  # COMMENTED (they looked and did NOT request changes) is the required second pair of eyes. Collected
+  # release-wide and used as the FALLBACK changeApprovedBy only when nobody explicitly approved /
+  # merged / published. A latest CHANGES_REQUESTED review is a rejection and is never collected here.
+  commenters=$(printf '%s' "$pr_json" | jq -r \
+    '[.reviews[]|select(.author.login!=null)]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="COMMENTED"))|.[].author.login' \
+    2>/dev/null || true)
+  if [ -n "$commenters" ]; then
+    while IFS= read -r rev; do
+      [ -n "$rev" ] || continue
+      if [ "$rev" != "$a" ] && ! is_bot "$rev"; then human_commenters="${human_commenters}${rev}
+"; fi
+    done <<<"$commenters"
   fi
 
   # PR cm-assessment block. A single block (or several that AGREE on the gating fields) is used;
@@ -327,37 +346,50 @@ if [ "$n_changes" -eq 0 ]; then changes_block="changes: []"; else changes_block=
 ${changes}"; fi
 [ "$n_changes" -eq 0 ] && [ "${n_refs:-0}" -gt 0 ] && log_warn "referenced ${n_refs} #number(s) but none were pull requests — recorded as a no-PR release"
 
-# --- Release-level CM approver(s) — `changeApprovedBy` (CM Standard SoD / SOC2). In CM terms an
-# approver is anyone who did NOT author the change and AGREED to ship it: a human who review-approved
-# a PR, merged one, or published/deployed the release. This is distinct from the GitHub "PR approval"
-# (`approvedBy`) and does NOT include a reviewer who only looked without objecting. The value is the
-# UNION of those humans, minus any contributing author, each verified to be a real person (GitHub
-# account type `User` — a fail-safe beyond BOT_IDENTITIES for app/service bots). None, and the
-# release carries changes => needs-review + `changeApprovedBy: []` so a human records the sign-off.
+# --- Release-level CM approver(s) — `changeApprovedBy` (CM Standard, separation of duties). In CM
+# terms an approver is anyone who did NOT author the change and did not reject it. Resolution ladder,
+# first non-empty tier wins, each candidate verified to be a real person (GitHub account type `User`,
+# a fail-safe beyond BOT_IDENTITIES for app/service bots):
+#   1-3. a non-author human who review-APPROVED a PR, MERGED one, or PUBLISHED/deployed the release;
+#   4.   else (approval policy: absence of rejection = approval) a non-author human who REVIEWED a PR
+#        without requesting changes — a COMMENTED review, the required second pair of eyes of record.
+# A CHANGES_REQUESTED review is a rejection and never qualifies. Distinct from the GitHub "PR
+# approval" (`approvedBy`). None derivable + the release carries changes => needs-review +
+# `changeApprovedBy: []` so a human records the out-of-band sign-off.
 dedup() { printf '%s\n' "$1" | { grep -v '^[[:space:]]*$' || true; } | awk '!seen[$0]++'; }
 authors_uniq=$(dedup "$authors_seen")
 not_author() { ! printf '%s\n' "$authors_uniq" | grep -qxF -- "$1"; }
 pick_humans() { local lg; while IFS= read -r lg; do [ -n "$lg" ] || continue; if not_author "$lg"; then printf '%s\n' "$lg"; fi; done <<<"$(dedup "$1")"; }
 
-# candidates = review-approvers ∪ mergers ∪ release publisher (approvers/mergers already
-# is_bot-filtered when collected; filter the publisher here)
+change_approvers=""; arr=""
+# Resolve a newline-delimited candidate list into changeApprovedBy: drop contributing authors, drop
+# anyone GitHub reports as not a `User` (app/service/org bots — fail-safe past BOT_IDENTITIES), and
+# record each remaining person once as their NAME (login fallback). Appends to change_approvers/arr.
+resolve_approvers() {
+  local lg uj nm disp
+  while IFS= read -r lg; do
+    [ -n "$lg" ] || continue
+    if printf '%s\n' "$change_approvers" | grep -qxF -- "$lg"; then continue; fi   # already recorded
+    uj=$(gh api "users/$lg" 2>/dev/null || echo '{}')
+    case "$(printf '%s' "$uj" | jq -r '.type // ""' 2>/dev/null)" in Bot|Organization|Mannequin) continue;; esac
+    nm=$(printf '%s' "$uj" | jq -r '.name // ""' 2>/dev/null || true)
+    case "$nm" in ""|null) disp="@$lg";; *) disp="$nm";; esac
+    change_approvers="${change_approvers}${lg}
+"
+    arr="${arr:+$arr, }$(yamlstr "$disp")"
+  done <<<"$(pick_humans "$1")"
+}
+
+# Tiers 1-3: review-approvers ∪ mergers ∪ non-author human release publisher (approvers/mergers are
+# already is_bot-filtered when collected; filter the publisher here).
 ca_cand="${human_approvers}
 ${human_mergers}"
 if [ -n "$release_author" ] && ! is_bot "$release_author"; then ca_cand="${ca_cand}
 ${release_author}"; fi
-
-change_approvers=""; arr=""
-while IFS= read -r lg; do
-  [ -n "$lg" ] || continue
-  uj=$(gh api "users/$lg" 2>/dev/null || echo '{}')
-  # Fail-safe past the denylist: a real approver is a GitHub `User`; drop app/service/org bots.
-  case "$(printf '%s' "$uj" | jq -r '.type // ""' 2>/dev/null)" in Bot|Organization|Mannequin) continue;; esac
-  nm=$(printf '%s' "$uj" | jq -r '.name // ""' 2>/dev/null || true)
-  case "$nm" in ""|null) disp="@$lg";; *) disp="$nm";; esac   # auditor-facing: the person's NAME (login fallback)
-  change_approvers="${change_approvers}${lg}
-"
-  arr="${arr:+$arr, }$(yamlstr "$disp")"
-done <<<"$(pick_humans "$ca_cand")"
+resolve_approvers "$ca_cand"
+# Tier 4 fallback: nobody explicitly approved/merged/published — accept the second pair of eyes, a
+# non-author human who reviewed a PR without requesting changes (COMMENTED). Only when 1-3 are empty.
+if [ -z "$change_approvers" ] && [ -n "$human_commenters" ]; then resolve_approvers "$human_commenters"; fi
 
 if [ -z "$change_approvers" ]; then
   change_approved_yaml="[]"
@@ -365,7 +397,7 @@ if [ -z "$change_approvers" ]; then
   # needs-review so a human records the out-of-band sign-off. A no-change release stays as-is.
   if [ "$n_changes" -gt 0 ]; then
     needs_review=1
-    log_warn "release $TAG: no CM approver (a non-author human who reviewed / merged / published) could be derived — assessmentStatus=needs-review; record the sign-off (e.g. Slack approval / manager attestation)"
+    log_warn "release $TAG: no CM approver (a non-author human who approved / merged / published, or reviewed without requesting changes) could be derived — assessmentStatus=needs-review; record the sign-off (e.g. Slack approval / manager attestation)"
   fi
 else
   change_approved_yaml="[${arr}]"
@@ -425,7 +457,7 @@ impact: ${impact}               # §3.1.1: no-impact | unnoticeable | degradatio
 risk: ${risk}                   # §3.1.1: minor | major
 assessmentStatus: ${status}     # assessed | partial | unassessed | needs-review (a human should check needs-review)
 assessedCoverage: "${coverage}"
-changeApprovedBy: ${change_approved_yaml}   # CM approver(s): non-author human(s) who reviewed/merged/published ([] + needs-review => record the sign-off)
+changeApprovedBy: ${change_approved_yaml}   # CM approver(s): non-author human(s) who approved/merged/published, or reviewed without rejecting ([] + needs-review => record the sign-off)
 environment: production
 ${changes_block}
 tested: "see this release's CI checks and post-deploy validation"

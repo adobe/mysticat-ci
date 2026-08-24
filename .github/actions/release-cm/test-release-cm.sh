@@ -412,6 +412,36 @@ run T39 v2
 { has 'approvalControl: human' && has 'changeApprovedBy: ["carol"]' && [ "$RC" -eq 0 ]; } \
   && ok "T39 human+bot approve -> human wins, changeApprovedBy=[carol]" || no "T39 mix" "$OUT"
 
+# ---------- T40 no explicit approval, but a non-author human REVIEWED without objecting (COMMENTED) ----------
+# CM approval policy: absence of rejection = approval. With no approver/merger/human-publisher, the
+# commenter is the fallback CM approver of record (name resolved). Release must NOT be needs-review.
+mkfix T40; printf 'fixes #4001\n' > "$FIXROOT/T40/release-body.txt"; echo null > "$FIXROOT/T40/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T40/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T40/release-author.txt"       # bot publisher -> no explicit approver/merger/publisher
+echo 'Fox Mulder' > "$FIXROOT/T40/user-mulder.txt"
+mkpr T40 4001 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"mulder"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+run T40 v2
+{ has 'changeApprovedBy: ["Fox Mulder"]' && ! has 'no CM approver' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T40 reviewed-without-objection is the fallback CM approver" || no "T40 commenter fallback" "$OUT"
+
+# ---------- T41 a reviewer who REQUESTED CHANGES (rejection) is never a fallback approver ----------
+mkfix T41; printf 'fixes #4101\n' > "$FIXROOT/T41/release-body.txt"; echo null > "$FIXROOT/T41/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T41/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T41/release-author.txt"
+mkpr T41 4101 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"mulder"},"state":"CHANGES_REQUESTED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+run T41 v2
+{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && has 'no CM approver' && ! has '@mulder' && [ "$RC" -eq 0 ]; } \
+  && ok "T41 changes-requested (rejection) is not a fallback approver -> needs-review" || no "T41 rejection excluded" "$OUT"
+
+# ---------- T42 an explicit approver is present -> the commenter is NOT added (fallback only) ----------
+mkfix T42; printf 'fixes #4201\n' > "$FIXROOT/T42/release-body.txt"; echo null > "$FIXROOT/T42/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T42/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T42/release-author.txt"
+mkpr T42 4201 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"dave"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
+run T42 v2
+{ has 'changeApprovedBy: ["@bob"]' && ! has 'dave' && [ "$RC" -eq 0 ]; } \
+  && ok "T42 explicit approver present -> commenter not added (fallback only)" || no "T42 fallback-only" "$OUT"
+
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"
