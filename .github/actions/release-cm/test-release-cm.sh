@@ -18,9 +18,13 @@ fi
 if [ "$1" = "release" ] && [ "$2" = "view" ]; then
   case "$*" in
     *publishedAt*) cat "$FIX/published.txt" 2>/dev/null || echo null; exit 0;;
+    *author*)      cat "$FIX/release-author.txt" 2>/dev/null || echo relmgr; exit 0;;  # publisher (human default)
     *body*)        [ -f "$FIX/release-view-fail" ] && { echo "HTTP 502" >&2; exit 1; }
                    cat "$FIX/release-body.txt" 2>/dev/null || echo ""; exit 0;;
   esac
+fi
+if [ "$1" = "api" ] && [ "${2#users/}" != "$2" ]; then   # users/<login> name lookup (best-effort)
+  cat "$FIX/user-${2#users/}.txt" 2>/dev/null || echo ""; exit 0
 fi
 if [ "$1" = "release" ] && [ "$2" = "edit" ]; then
   [ -f "$FIX/release-edit-fail" ] && { echo "HTTP 403" >&2; exit 1; }
@@ -151,11 +155,14 @@ run T7d v2
   && has 'impact: unknown' && has 'risk: unknown' && [ "$RC" -eq 0 ]; } \
   && ok "T7d partial conflict: aggregate kept, per-PR unknown" || no "T7d partial conflict" "$OUT"
 
-# ---------- T8 AI-agent approves bot PR -> independent true ----------
+# ---------- T8 AI reviewer (MysticatBot) approval is NOT an independent human (SOC2) ----------
+# MysticatBot is a GitHub "User" (not a *[bot] login), so it must be caught by the hardcoded
+# denylist. approvedBy still lists it (transparency); independentlyApproved must be false.
 mkfix T8; printf 'fixes #801\n' > "$FIXROOT/T8/release-body.txt"; echo null > "$FIXROOT/T8/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T8/releases.txt"
-mkpr T8 801 'renovate[bot]' 'bump' '[{"author":{"login":"claude[bot]"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+mkpr T8 801 alice 'bump' '[{"author":{"login":"MysticatBot"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T8 v2
-{ has 'independentlyApproved: true' && [ "$RC" -eq 0 ]; } && ok "T8 AI-agent approval is independent" || no "T8 AI-agent approval is independent" "$OUT"
+{ has 'independentlyApproved: false' && has 'approvedBy: ["MysticatBot"]' && [ "$RC" -eq 0 ]; } \
+  && ok "T8 AI reviewer approval is not independent" || no "T8 AI reviewer approval is not independent" "$OUT"
 
 # ---------- T9 stale approve-then-changes-requested -> not counted ----------
 mkfix T9; printf 'fixes #901\n' > "$FIXROOT/T9/release-body.txt"; echo null > "$FIXROOT/T9/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T9/releases.txt"
@@ -330,9 +337,46 @@ run T31 v2
 { has 'impact: degradation' && has 'risk: minor' && has 'changeType: standard' && ! has 'changeType: normal' && [ "$RC" -eq 0 ]; } \
   && ok "T31 reversible degradation stays standard (gate is risk, not impact)" || no "T31 reversible degradation stays standard" "$OUT"
 
+# ---------- T32 fully automated (AI approval + bot publisher, no human) -> needs a human approver ----------
+mkfix T32; printf 'fixes #3201\n' > "$FIXROOT/T32/release-body.txt"; echo null > "$FIXROOT/T32/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T32/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T32/release-author.txt"
+mkpr T32 3201 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"MysticatBot"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+run T32 v2
+{ has 'assessmentStatus: needs-review' && has 'no human approver could be derived' && has 'approvedBy: []' && [ "$RC" -eq 0 ]; } \
+  && ok "T32 all-automation -> needs a human approver" || no "T32 all-automation" "$OUT"
+
+# ---------- T33 human PR approver -> listed as the release approver (name resolved) ----------
+mkfix T33; printf 'fixes #3301\n' > "$FIXROOT/T33/release-body.txt"; echo null > "$FIXROOT/T33/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T33/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T33/release-author.txt"     # publisher is a bot -> approver must come from the human reviewer
+echo 'Dana Scully' > "$FIXROOT/T33/user-dana.txt"
+mkpr T33 3301 alice "$(blk 'impact: unnoticeable
+risk: minor')" '[{"author":{"login":"dana"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
+run T33 v2
+{ has 'approvedBy: ["Dana Scully"]' && ! has 'no human approver' && [ "$RC" -eq 0 ]; } \
+  && ok "T33 human PR approver is the release approver" || no "T33 human PR approver" "$OUT"
+
+# ---------- T34 no reviewer, bot publisher, human merger -> merger is the approver ----------
+mkfix T34; printf 'fixes #3401\n' > "$FIXROOT/T34/release-body.txt"; echo null > "$FIXROOT/T34/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T34/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T34/release-author.txt"
+jq -n --arg a alice --arg m erin '{author:{login:$a},labels:[],reviews:[],body:"x",mergedBy:{login:$m}}' > "$FIXROOT/T34/pr-3401.json"
+run T34 v2
+{ has 'approvedBy: ["@erin"]' && ! has 'no human approver' && [ "$RC" -eq 0 ]; } \
+  && ok "T34 human merger is the release approver" || no "T34 human merger" "$OUT"
+
+# ---------- T35 release published by the change author -> not a valid approver -> needs-review ----------
+mkfix T35; printf 'fixes #3501\n' > "$FIXROOT/T35/release-body.txt"; echo null > "$FIXROOT/T35/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T35/releases.txt"
+echo 'alice' > "$FIXROOT/T35/release-author.txt"                   # same person who authored the change
+mkpr T35 3501 alice "$(blk 'impact: unnoticeable
+risk: minor')" "$NOREV" "$NOLBL"
+run T35 v2
+{ has 'assessmentStatus: needs-review' && has 'no human approver' && [ "$RC" -eq 0 ]; } \
+  && ok "T35 author-as-publisher is not an approver -> needs-review" || no "T35 author self-approval" "$OUT"
+
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"
 run T7 v2;  { yaml_ok; } && ok "YAML valid (T7)" || no "YAML valid (T7)" "$OUT"
+run T32 v2; { yaml_ok; } && ok "YAML valid (T32 empty approvedBy)" || no "YAML valid (T32)" "$OUT"
 
 echo
 echo "-------- $pass passed, $fail failed --------"

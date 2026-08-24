@@ -55,9 +55,23 @@ lc()       { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 yamlstr()  { jq -Rn --arg s "$1" '$s'; }   # encode arbitrary text as a valid (quoted) YAML/JSON scalar
 errf=""; trap 'rm -f "${errf:-}"' EXIT
 
-# Reviewer logins that are the CI/publishing identity, not an independent reviewer — an
-# auto-approve step running as one of these is self-approval by proxy, not segregation.
-CI_IDENTITIES="github-actions[bot]"
+# Automation identities that do NOT count as a human approver. The CM Standard's human-approver
+# requirement (SOC2) is satisfied only by a login that is NOT one of these. A `*[bot]` login is
+# always automation; the rest are a hardcoded, known set (AI reviewers, CI, mergers) extendable
+# via the BOT_IDENTITIES env (one login per line). Matched case-insensitively, whole-login.
+BOT_IDENTITIES="${BOT_IDENTITIES:-}
+github-actions[bot]
+renovate[bot]
+renovate-approve
+dependabot[bot]
+kodiakhq[bot]
+MysticatBot
+MysticatBot-Dev
+mysticatbot_adobe"
+is_bot() {   # $1 = login; returns 0 (true) when the login is automation, 1 when it is a human
+  case "$1" in *'[bot]') return 0;; esac
+  printf '%s\n' "$BOT_IDENTITIES" | grep -qixF -- "$1"
+}
 
 # --- §3.1.1 severity helpers (rank <-> name; validation) ---
 impact_rank() { case "$1" in no-impact) echo 0;; unnoticeable) echo 1;; degradation) echo 2;; outage) echo 3;; *) echo -1;; esac; }
@@ -115,6 +129,11 @@ prev=$(gh release list -R "$REPO" -L 200 --json tagName,isDraft,isPrerelease 2>/
   | awk -v t="$TAG" 'found{print; exit} $0==t{found=1}' || true)
 [ -n "$prev" ] || prev=unknown
 
+# Release publisher = who cut/deployed the release (a human here can be the release approver when
+# no human reviewed the PRs). For an auto-release (semantic-release/app bot) this is automation.
+release_author=$(gh release view "$TAG" -R "$REPO" --json author -q '.author.login // ""' 2>/dev/null || true)
+case "$release_author" in null) release_author="";; esac
+
 # --- Verify the token can actually see pull requests, so a genuine issue-ref (skipped
 # below) is never confused with a PR made invisible by a missing scope — which would
 # otherwise skip every PR and record a green, evidence-free release (fail open).
@@ -128,9 +147,11 @@ n_refs=$(printf '%s' "$pr_nums" | wc -w | tr -d ' ')
 
 changes=""; high_risk=""; n_changes=0; n_assessed=0; n_unknown=0; needs_review=""
 agg_impact=-1; agg_risk=-1; agg_ctype=0   # -1 = no PR seen yet; per-PR baseline applied below
+# Release-wide human-approver signals (newline-delimited logins), resolved into approvedBy below.
+authors_seen=""; human_approvers=""; human_mergers=""; human_commenters=""
 for n in $pr_nums; do
   errf=$(mktemp)
-  if ! pr_json=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews,body 2>"$errf"); then
+  if ! pr_json=$(gh pr view "$n" -R "$REPO" --json author,labels,reviews,body,mergedBy 2>"$errf"); then
     if grep -qiE 'Could not resolve to (a |an )?(PullRequest|Issue)|no pull requests found|not found' "$errf"; then
       rm -f "$errf"; continue                       # a #NNN that is an issue, not a PR — skip
     fi
@@ -142,13 +163,18 @@ for n in $pr_nums; do
   a=$(printf '%s' "$pr_json" | jq -r '.author.login // ""')
   [ -n "$a" ] || continue
   n_changes=$((n_changes + 1))
+  authors_seen="${authors_seen}${a}
+"
+  mb=$(printf '%s' "$pr_json" | jq -r '.mergedBy.login // ""')
+  if [ -n "$mb" ] && [ "$mb" != "$a" ] && ! is_bot "$mb"; then human_mergers="${human_mergers}${mb}
+"; fi
   [ "$(printf '%s' "$pr_json" | jq -r '(([.labels[].name]|index("cmr:high-risk"))!=null)')" = "true" ] && high_risk=1
 
   # Approving reviewers: each reviewer's LATEST review, kept only if its state is APPROVED.
-  # independentlyApproved = a reviewer other than the author AND not the CI/publishing
-  # identity approved — human OR AI agent (an approval-independence signal, not a full SoD
-  # attestation; whether an agent approval satisfies the CM Standard's SoD is a CM Process
-  # Owner question). Only the CI identity is excluded, so a real reviewing agent still counts.
+  # independentlyApproved = a HUMAN reviewer (not the author, not automation per BOT_IDENTITIES)
+  # approved. An AI reviewer (e.g. MysticatBot) or renovate-approve does NOT satisfy it — the CM
+  # Standard's human-approver requirement is human-only (security decision, SOC2). approvedBy still
+  # lists every approver (human or bot) for transparency; the human ones feed approvedBy below.
   approvers=$(printf '%s' "$pr_json" | jq -r \
     '[.reviews[]|select(.author.login!=null)]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="APPROVED"))|.[].author.login' \
     2>/dev/null || true)
@@ -158,9 +184,21 @@ for n in $pr_nums; do
     while IFS= read -r rev; do
       [ -n "$rev" ] || continue
       arr="${arr:+$arr, }$(yamlstr "$rev")"
-      [ "$rev" != "$a" ] && ! grep -qxF -- "$rev" <<<"$CI_IDENTITIES" && independent=true
+      if [ "$rev" != "$a" ] && ! is_bot "$rev"; then independent=true; human_approvers="${human_approvers}${rev}
+"; fi
     done <<<"$approvers"
     approved_arr="[${arr}]"
+  fi
+  # Weak fallback pool: human reviewers whose LATEST review is COMMENTED (engaged, did not reject).
+  commenters=$(printf '%s' "$pr_json" | jq -r \
+    '[.reviews[]|select(.author.login!=null)]|group_by(.author.login)|map(sort_by(.submittedAt)|last)|map(select(.state=="COMMENTED"))|.[].author.login' \
+    2>/dev/null || true)
+  if [ -n "$commenters" ]; then
+    while IFS= read -r rev; do
+      [ -n "$rev" ] || continue
+      if [ "$rev" != "$a" ] && ! is_bot "$rev"; then human_commenters="${human_commenters}${rev}
+"; fi
+    done <<<"$commenters"
   fi
 
   # PR cm-assessment block. A single block (or several that AGREE on the gating fields) is used;
@@ -265,6 +303,42 @@ if [ "$n_changes" -eq 0 ]; then changes_block="changes: []"; else changes_block=
 ${changes}"; fi
 [ "$n_changes" -eq 0 ] && [ "${n_refs:-0}" -gt 0 ] && log_warn "referenced ${n_refs} #number(s) but none were pull requests — recorded as a no-PR release"
 
+# --- Release-level HUMAN approver (CM Standard SoD / SOC2). First human that is NOT a contributing
+# author, in order: (1) a human PR approver, (2) the human who published/deployed the release,
+# (3) the human who merged a PR (merge authorizes the prod deploy), (4) a human reviewer who engaged
+# without objecting. None => needs-review + empty approvedBy so a human records the out-of-band sign-off.
+dedup() { printf '%s\n' "$1" | { grep -v '^[[:space:]]*$' || true; } | awk '!seen[$0]++'; }
+authors_uniq=$(dedup "$authors_seen")
+not_author() { ! printf '%s\n' "$authors_uniq" | grep -qxF -- "$1"; }
+pick_humans() { local lg; while IFS= read -r lg; do [ -n "$lg" ] || continue; if not_author "$lg"; then printf '%s\n' "$lg"; fi; done <<<"$(dedup "$1")"; }
+
+approver_logins=$(pick_humans "$human_approvers")
+if [ -z "$approver_logins" ] && [ -n "$release_author" ] && ! is_bot "$release_author" && not_author "$release_author"; then
+  approver_logins="$release_author"
+fi
+[ -n "$approver_logins" ] || approver_logins=$(pick_humans "$human_mergers")
+[ -n "$approver_logins" ] || approver_logins=$(pick_humans "$human_commenters")
+
+if [ -z "$approver_logins" ]; then
+  approved_by_yaml="[]"
+  # A release that actually carries changes MUST name a human approver; if none is derivable it is
+  # incomplete -> needs-review so a human records the out-of-band sign-off. A no-change release
+  # (n_changes==0) stays as-is (already unassessed / nothing to approve).
+  if [ "$n_changes" -gt 0 ]; then
+    needs_review=1
+    log_warn "release $TAG: no human approver could be derived — assessmentStatus=needs-review; record the sign-off (e.g. Slack approval / manager attestation)"
+  fi
+else
+  arr=""
+  while IFS= read -r lg; do
+    [ -n "$lg" ] || continue
+    nm=$(gh api "users/$lg" -q '.name // ""' 2>/dev/null || true)
+    case "$nm" in ""|null) disp="@$lg";; *) disp="$nm";; esac   # auditor-facing: the person's name (login only as fallback)
+    arr="${arr:+$arr, }$(yamlstr "$disp")"
+  done <<<"$approver_logins"
+  approved_by_yaml="[${arr}]"
+fi
+
 # No PR seen at all: fall back to the §3.1.1 baseline (unnoticeable / minor).
 [ "$agg_impact" -lt 0 ] && agg_impact=1
 [ "$agg_risk" -lt 0 ]   && agg_risk=0
@@ -319,6 +393,7 @@ impact: ${impact}               # §3.1.1: no-impact | unnoticeable | degradatio
 risk: ${risk}                   # §3.1.1: minor | major
 assessmentStatus: ${status}     # assessed | partial | unassessed | needs-review (a human should check needs-review)
 assessedCoverage: "${coverage}"
+approvedBy: ${approved_by_yaml}   # human approver(s) for this release ([] + needs-review => record the sign-off)
 environment: production
 ${changes_block}
 tested: "see this release's CI checks and post-deploy validation"

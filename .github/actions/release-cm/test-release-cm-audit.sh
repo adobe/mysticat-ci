@@ -20,6 +20,7 @@ if [ "$1" = "release" ] && [ "$2" = "view" ]; then
   tag="$3"
   case "$*" in
     *publishedAt*) awk -F'\t' -v t="$tag" '$1==t{print $2}' "$FIX/releases.tsv"; exit 0;;
+    *author*)      echo relmgr; exit 0;;
     *body*)        cat "$FIX/body-$tag.txt" 2>/dev/null || echo ""; exit 0;;
   esac
 fi
@@ -127,6 +128,7 @@ if [ "$1" = "release" ] && [ "$2" = "view" ]; then
   tag="$3"
   case "$*" in
     *publishedAt*) awk -F'\t' -v t="$tag" '$1==t{print $2}' "$FIX/releases.tsv"; exit 0;;
+    *author*)      echo relmgr; exit 0;;
     *body*)        cat "$FIX/body-$tag.txt" 2>/dev/null || echo ""; exit 0;;
   esac
 fi
