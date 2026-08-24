@@ -30,16 +30,32 @@
 #                 from a release-level signal (a hotfix-style tag or RELEASE_CM_EMERGENCY), never
 #                 aggregated up from a PR that merely fixed an incident.
 #   changes[]     per merged PR: author, approving reviewer login(s) (each reviewer's latest
-#                 review, kept only if APPROVED), independentlyApproved (a reviewer other than
-#                 the author AND not the CI identity approved — human or AI agent; an
-#                 approval-independence signal, not a full SoD attestation), the PR's own
-#                 impact/risk (or `unknown` per field when invalid), and its backout if given.
+#                 review, kept only if APPROVED — human OR automation), independentlyApproved (a
+#                 HUMAN reviewer other than the author approved; automation does NOT count),
+#                 approvalControl (human | automated | none — the sanctioned control that signed
+#                 off; `automated` = an AI/policy approver ran, `none` = no approval at all), the
+#                 PR's own impact/risk (or `unknown` per field when invalid), and its backout.
+#   approvedBy    RELEASE-level HUMAN approver name(s) — see the approval-flow tracking section below.
 #
 # Content in the repos is trusted; the script validates for syntax mistakes only. A human
 # can override the result: the script never overwrites an existing block, so editing the
 # Change Management block in the release notes (or the PR's cm-assessment block before the
 # release is cut) is preserved. To override a PR's assessment, EDIT its block in place —
 # appending a second, disagreeing block does not silently win; it resolves to needs-review.
+#
+# Approval-flow tracking (CM Standard / SOC2 — a change needs an independent human approver):
+#   * Human vs automation is decided by BOT_IDENTITIES (below): `*[bot]` plus a hardcoded set of
+#     AI/CI/merge accounts (MysticatBot is a GitHub *User*, so it is listed explicitly). Everyone
+#     else is a human. Extend via the BOT_IDENTITIES env (one login per line).
+#   * PER PR (changes[]): approvalControl records the sanctioned control — `human`, `automated`
+#     (AI review per the pr-review escalation rules, or a policy auto-approver — it RAN, not a
+#     skip), or `none` (no approval). independentlyApproved is the human-only subset.
+#   * PER RELEASE (approvedBy): the required human approver, resolved as the first human that is
+#     NOT a contributing author, in order — (1) human PR approver, (2) human release publisher/
+#     deployer, (3) human merger, (4) human reviewer who did not object. If none and the release
+#     has changes => assessmentStatus: needs-review + approvedBy: [] so a human records the
+#     out-of-band sign-off (e.g. a Slack approval). The value is the person's NAME (login fallback).
+#   Full write-up: mysticat-architecture platform/decisions/release-cm-attributes-mitigation.md.
 #
 # Idempotent. Decoration only — no ServiceNow API calls.
 #
@@ -276,6 +292,15 @@ for n in $pr_nums; do
   [ "$pr_ctype" = emergency ] && pr_ctype=""
   if [ -n "$pr_ctype" ]; then cr=$(ctype_rank "$pr_ctype"); [ "$cr" -gt "$agg_ctype" ] && agg_ctype=$cr; fi
 
+  # approvalControl = which sanctioned control signed off this PR: `human` (a person, not the
+  # author, approved), `automated` (an approval exists but only from automation — the AI reviewer
+  # per the pr-review escalation rules, or a policy auto-approver: a control that RAN, not a skip),
+  # or `none` (no approving review — a genuine gap). Distinguishes controlled-auto from unreviewed.
+  if   [ "$independent" = true ]; then approval_control=human
+  elif [ -n "$approvers" ];       then approval_control=automated
+  else                                 approval_control=none
+  fi
+
   # Per-PR display: each field shows its value if valid, `unknown` if present-but-invalid or
   # the block was structurally unusable, and is omitted if the PR simply carried no assessment.
   di=""; if [ -n "$pr_impact" ]; then di=$pr_impact; elif [ -n "$impact_bad" ] || [ -n "$unparsed" ]; then di=unknown; fi
@@ -295,7 +320,8 @@ for n in $pr_nums; do
   changes="${changes}  - pr: ${n}
     author: $(yamlstr "$a")
     approvedBy: ${approved_arr}
-    independentlyApproved: ${independent}${extra}
+    independentlyApproved: ${independent}
+    approvalControl: ${approval_control}${extra}
 "
 done
 changes="${changes%$'\n'}"

@@ -161,14 +161,14 @@ run T7d v2
 mkfix T8; printf 'fixes #801\n' > "$FIXROOT/T8/release-body.txt"; echo null > "$FIXROOT/T8/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T8/releases.txt"
 mkpr T8 801 alice 'bump' '[{"author":{"login":"MysticatBot"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T8 v2
-{ has 'independentlyApproved: false' && has 'approvedBy: ["MysticatBot"]' && [ "$RC" -eq 0 ]; } \
-  && ok "T8 AI reviewer approval is not independent" || no "T8 AI reviewer approval is not independent" "$OUT"
+{ has 'independentlyApproved: false' && has 'approvalControl: automated' && has 'approvedBy: ["MysticatBot"]' && [ "$RC" -eq 0 ]; } \
+  && ok "T8 AI reviewer approval is not independent (approvalControl: automated)" || no "T8 AI reviewer approval is not independent" "$OUT"
 
 # ---------- T9 stale approve-then-changes-requested -> not counted ----------
 mkfix T9; printf 'fixes #901\n' > "$FIXROOT/T9/release-body.txt"; echo null > "$FIXROOT/T9/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T9/releases.txt"
 mkpr T9 901 alice 'x' '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"bob"},"state":"CHANGES_REQUESTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
 run T9 v2
-{ has 'approvedBy: []' && has 'independentlyApproved: false' && [ "$RC" -eq 0 ]; } && ok "T9 stale approval excluded" || no "T9 stale approval excluded" "$OUT"
+{ has 'approvedBy: []' && has 'independentlyApproved: false' && has 'approvalControl: none' && [ "$RC" -eq 0 ]; } && ok "T9 stale approval excluded (approvalControl: none)" || no "T9 stale approval excluded" "$OUT"
 
 # ---------- T10 missing .snow.yml -> abort ----------
 mkfix T10; printf 'fixes #1001\n' > "$FIXROOT/T10/release-body.txt"; echo null > "$FIXROOT/T10/published.txt"; printf 'v2\n' > "$FIXROOT/T10/releases.txt"
@@ -353,8 +353,8 @@ echo 'Dana Scully' > "$FIXROOT/T33/user-dana.txt"
 mkpr T33 3301 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"dana"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T33 v2
-{ has 'approvedBy: ["Dana Scully"]' && ! has 'no human approver' && [ "$RC" -eq 0 ]; } \
-  && ok "T33 human PR approver is the release approver" || no "T33 human PR approver" "$OUT"
+{ has 'approvedBy: ["Dana Scully"]' && has 'approvalControl: human' && ! has 'no human approver' && [ "$RC" -eq 0 ]; } \
+  && ok "T33 human PR approver is the release approver (approvalControl: human)" || no "T33 human PR approver" "$OUT"
 
 # ---------- T34 no reviewer, bot publisher, human merger -> merger is the approver ----------
 mkfix T34; printf 'fixes #3401\n' > "$FIXROOT/T34/release-body.txt"; echo null > "$FIXROOT/T34/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T34/releases.txt"
