@@ -158,20 +158,20 @@ run T7d v2
   && has 'impact: unknown' && has 'risk: unknown' && [ "$RC" -eq 0 ]; } \
   && ok "T7d partial conflict: aggregate kept, per-PR unknown" || no "T7d partial conflict" "$OUT"
 
-# ---------- T8 AI reviewer (MysticatBot) approval is NOT an independent human (CM Standard) ----------
-# MysticatBot is a GitHub "User" (not a *[bot] login), so it must be caught by the hardcoded
-# denylist. approvedBy still lists it (transparency); independentlyApproved must be false.
+# ---------- T8 an AI reviewer (MysticatBot, a bot) is NOT a change approver ----------
+# MysticatBot is a GitHub "User" (not a *[bot] login) caught by the hardcoded denylist, so its
+# approval never becomes a changeApprovedBy. Per-PR is empty; the release approver is the publisher.
 mkfix T8; printf 'fixes #801\n' > "$FIXROOT/T8/release-body.txt"; echo null > "$FIXROOT/T8/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T8/releases.txt"
 mkpr T8 801 alice 'bump' '[{"author":{"login":"MysticatBot"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T8 v2
-{ has 'independentlyApproved: false' && has 'approvalControl: automated' && has 'approvedBy: ["MysticatBot"]' && [ "$RC" -eq 0 ]; } \
-  && ok "T8 AI reviewer approval is not independent (approvalControl: automated)" || no "T8 AI reviewer approval is not independent" "$OUT"
+{ has 'changeApprovedBy: []' && ! has 'MysticatBot' && ! has 'approvedBy' && ! has 'approvalControl' && [ "$RC" -eq 0 ]; } \
+  && ok "T8 AI reviewer (bot) is not a change approver" || no "T8 AI reviewer bot" "$OUT"
 
 # ---------- T9 stale approve-then-changes-requested -> not counted ----------
 mkfix T9; printf 'fixes #901\n' > "$FIXROOT/T9/release-body.txt"; echo null > "$FIXROOT/T9/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T9/releases.txt"
 mkpr T9 901 alice 'x' '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"bob"},"state":"CHANGES_REQUESTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
 run T9 v2
-{ has 'approvedBy: []' && has 'independentlyApproved: false' && has 'approvalControl: none' && [ "$RC" -eq 0 ]; } && ok "T9 stale approval excluded (approvalControl: none)" || no "T9 stale approval excluded" "$OUT"
+{ has 'changeApprovedBy: []' && ! has 'approvedBy' && ! has 'approvalControl' && [ "$RC" -eq 0 ]; } && ok "T9 stale approve-then-changes-requested (rejecter) is not a change approver" || no "T9 stale approval excluded" "$OUT"
 
 # ---------- T10 missing .snow.yml -> abort ----------
 mkfix T10; printf 'fixes #1001\n' > "$FIXROOT/T10/release-body.txt"; echo null > "$FIXROOT/T10/published.txt"; printf 'v2\n' > "$FIXROOT/T10/releases.txt"
@@ -301,12 +301,12 @@ risk: minor')" "$NOREV" "$NOLBL"
 OUT=$( cd "$FIXROOT/T26"; FIX="$FIXROOT/T26" SNOW_YML="$FIXROOT/snow-inline.yml" REPO=x/y bash "$SCRIPT" v2 2>&1 ); RC=$?
 { has '::error::' && has 'failed to update release' && [ "$RC" -ne 0 ]; } && ok "T26 edit failure aborts" || no "T26 edit failure aborts" "$OUT"
 
-# ---------- T27 github-actions[bot] (CI identity) approver -> NOT independent ----------
+# ---------- T27 github-actions[bot] (CI identity) approval is NOT a change approver ----------
 mkfix T27; printf 'fixes #2701\n' > "$FIXROOT/T27/release-body.txt"; echo null > "$FIXROOT/T27/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T27/releases.txt"
 mkpr T27 2701 alice 'x' '[{"author":{"login":"github-actions[bot]"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T27 v2
-{ has 'approvedBy: ["github-actions[bot]"]' && has 'independentlyApproved: false' && [ "$RC" -eq 0 ]; } \
-  && ok "T27 CI identity not independent" || no "T27 CI identity not independent" "$OUT"
+{ has 'changeApprovedBy: []' && ! has 'github-actions' && ! has 'approvedBy' && [ "$RC" -eq 0 ]; } \
+  && ok "T27 CI identity (bot) is not a change approver" || no "T27 CI identity bot" "$OUT"
 
 # ---------- T28 single-line backout that starts with > -> NOT flagged, kept ----------
 mkfix T28; printf 'fixes #2801\n' > "$FIXROOT/T28/release-body.txt"; echo null > "$FIXROOT/T28/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T28/releases.txt"
@@ -356,8 +356,8 @@ echo 'Dana Scully' > "$FIXROOT/T33/user-dana.txt"
 mkpr T33 3301 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"dana"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"
 run T33 v2
-{ has 'changeApprovedBy: ["Dana Scully"]' && has 'changeApprovedBy: ["dana"]' && has 'approvalControl: human' && ! has 'no CM approver' && [ "$RC" -eq 0 ]; } \
-  && ok "T33 human PR approver -> release + per-PR changeApprovedBy" || no "T33 human PR approver" "$OUT"
+{ has 'changeApprovedBy: ["Dana Scully"]' && ! has 'approvalControl' && ! has 'no CM approver' && [ "$RC" -eq 0 ]; } \
+  && ok "T33 human PR approver -> per-PR + release changeApprovedBy (name)" || no "T33 human PR approver" "$OUT"
 
 # ---------- T34 no reviewer, bot publisher, human merger -> merger is the CM approver ----------
 mkfix T34; printf 'fixes #3401\n' > "$FIXROOT/T34/release-body.txt"; echo null > "$FIXROOT/T34/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T34/releases.txt"
@@ -395,22 +395,24 @@ run T37 v2
 { has 'changeApprovedBy: ["@bob", "@relmgr"]' && [ "$RC" -eq 0 ]; } \
   && ok "T37 release changeApprovedBy is the union (reviewer + publisher)" || no "T37 union" "$OUT"
 
-# ---------- T38 multi-PR/multi-author: a reviewer who authored a SIBLING PR is excluded ----------
+# ---------- T38 multi-PR/multi-author: a reviewer who authored a SIBLING PR may still approve another change ----------
+# Per-change SoD: bob did not author #3801, so his approval of it is valid — even though he authored
+# the sibling #3802. #3801 -> bob; #3802 (bob's own) -> no approver.
 mkfix T38; printf 'fixes #3801 and #3802\n' > "$FIXROOT/T38/release-body.txt"; echo null > "$FIXROOT/T38/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T38/releases.txt"
 echo 'github-actions[bot]' > "$FIXROOT/T38/release-author.txt"
 mkpr T38 3801 alice 'x' '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"  # bob approves PR#3801
-mkpr T38 3802 bob 'y' "$NOREV" "$NOLBL"                                                                                 # ...but bob authored PR#3802
+mkpr T38 3802 bob 'y' "$NOREV" "$NOLBL"                                                                                 # ...and bob authored PR#3802 (its own change: no approver)
 run T38 v2
-{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && [ "$RC" -eq 0 ]; } \
-  && ok "T38 sibling-PR author excluded as release approver -> needs-review" || no "T38 multi-author exclusion" "$OUT"
+{ has 'changeApprovedBy: ["@bob"]' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T38 sibling-PR author approves a change they did not author" || no "T38 per-change approver" "$OUT"
 
-# ---------- T39 MIX: human + bot both APPROVE one PR -> approvalControl human, changeApprovedBy = human ----------
+# ---------- T39 MIX: human + bot both APPROVE one PR -> only the human is a change approver ----------
 mkfix T39; printf 'fixes #3901\n' > "$FIXROOT/T39/release-body.txt"; echo null > "$FIXROOT/T39/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T39/releases.txt"
 mkpr T39 3901 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"MysticatBot"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"carol"},"state":"APPROVED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
 run T39 v2
-{ has 'approvalControl: human' && has 'changeApprovedBy: ["carol"]' && [ "$RC" -eq 0 ]; } \
-  && ok "T39 human+bot approve -> human wins, changeApprovedBy=[carol]" || no "T39 mix" "$OUT"
+{ has 'changeApprovedBy: ["@carol"]' && ! has 'MysticatBot' && ! has 'approvalControl' && [ "$RC" -eq 0 ]; } \
+  && ok "T39 human+bot approve -> only the human counts (@carol)" || no "T39 mix" "$OUT"
 
 # ---------- T40 no explicit approval, but a non-author human REVIEWED without objecting (COMMENTED) ----------
 # CM no-objection approval policy: a review without a change-request is approval. With no approver/merger/human-publisher, the
@@ -433,14 +435,15 @@ run T41 v2
 { has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && has 'no CM approver' && ! has '@mulder' && [ "$RC" -eq 0 ]; } \
   && ok "T41 changes-requested (rejection) is not a fallback approver -> needs-review" || no "T41 rejection excluded" "$OUT"
 
-# ---------- T42 an explicit approver is present -> the commenter is NOT added (fallback only) ----------
+# ---------- T42 every non-author human who engaged (approve + comment) is a change approver ----------
+# No tiering per change: an APPROVED reviewer and a non-objecting commenter both approved the change.
 mkfix T42; printf 'fixes #4201\n' > "$FIXROOT/T42/release-body.txt"; echo null > "$FIXROOT/T42/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T42/releases.txt"
 echo 'github-actions[bot]' > "$FIXROOT/T42/release-author.txt"
 mkpr T42 4201 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"dave"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
 run T42 v2
-{ has 'changeApprovedBy: ["@bob"]' && ! has 'dave' && [ "$RC" -eq 0 ]; } \
-  && ok "T42 explicit approver present -> commenter not added (fallback only)" || no "T42 fallback-only" "$OUT"
+{ has 'changeApprovedBy: ["@bob", "@dave"]' && [ "$RC" -eq 0 ]; } \
+  && ok "T42 approver + non-objecting commenter both counted" || no "T42 engagers union" "$OUT"
 
 # ---------- T43 changes-requested THEN commented (same reviewer) -> unresolved rejection, NOT an approver ----------
 # A later COMMENTED review does not clear an outstanding CHANGES_REQUESTED, so this reviewer must not
@@ -500,19 +503,21 @@ echo 'github-actions[bot]' > "$FIXROOT/T48/release-author.txt"
 mkpr T48 4801 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"bob"},"state":"APPROVED","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"bob"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z"}]' "$NOLBL"
 run T48 v2
-{ has 'approvalControl: human' && has 'independentlyApproved: true' && has 'changeApprovedBy: ["@bob"]' && [ "$RC" -eq 0 ]; } \
+{ has 'changeApprovedBy: ["@bob"]' && ! has 'approvalControl' && [ "$RC" -eq 0 ]; } \
   && ok "T48 approve-then-comment keeps the approval (verdict-aware)" || no "T48 approve-then-comment" "$OUT"
 
-# ---------- T49 a commenter who authored a SIBLING PR in the release is excluded ----------
+# ---------- T49 a commenter who authored a SIBLING PR may still approve another change ----------
+# bob engaged with #4901 (alice's change) via a comment and did not object -> approver of #4901;
+# his own #4902 has no approver. Per-change SoD, mirror of T38 on the no-objection path.
 mkfix T49; printf 'fixes #4901 and #4902\n' > "$FIXROOT/T49/release-body.txt"; echo null > "$FIXROOT/T49/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T49/releases.txt"
 echo 'github-actions[bot]' > "$FIXROOT/T49/release-author.txt"
 mkpr T49 4901 alice "$(blk 'impact: unnoticeable
 risk: minor')" '[{"author":{"login":"bob"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z"}]' "$NOLBL"   # bob comments on #4901
 mkpr T49 4902 bob "$(blk 'impact: unnoticeable
-risk: minor')" "$NOREV" "$NOLBL"                                                                                # ...but bob authored #4902
+risk: minor')" "$NOREV" "$NOLBL"                                                                                # ...and bob authored #4902 (no approver)
 run T49 v2
-{ has 'assessmentStatus: needs-review' && has 'changeApprovedBy: []' && [ "$RC" -eq 0 ]; } \
-  && ok "T49 commenter who authored a sibling PR is excluded -> needs-review" || no "T49 commenter sibling-author" "$OUT"
+{ has 'changeApprovedBy: ["@bob"]' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T49 sibling-PR author approves a different change via comment" || no "T49 per-change commenter" "$OUT"
 
 # ---------- T50 an assigned/requested reviewer with NO activity does NOT count (we can't tell they looked) ----------
 # reviewRequests is present but must be IGNORED — a review request is not evidence the assignee looked.
@@ -530,6 +535,25 @@ jq -n --arg a alice '{author:{login:$a},labels:[],reviews:[],mergedBy:null,comme
 run T51 v2
 { has 'changeApprovedBy: ["Dana Scully"]' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
   && ok "T51 PR conversation comment is engagement -> no-objection approver" || no "T51 issue-commenter" "$OUT"
+
+# ---------- T52 the PR's OWN author is excluded from its changeApprovedBy even if they approve/comment/merge it ----------
+# Exercises the `- [$a]` self-approval subtraction directly: alice approves + comments + self-merges
+# her own PR (all must be dropped); non-author bob's comment is the only real approver.
+mkfix T52; printf 'fixes #5201\n' > "$FIXROOT/T52/release-body.txt"; echo null > "$FIXROOT/T52/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T52/releases.txt"
+echo 'github-actions[bot]' > "$FIXROOT/T52/release-author.txt"
+jq -n '{author:{login:"alice"},labels:[],reviews:[{author:{login:"alice"},state:"APPROVED",submittedAt:"2026-01-01T00:00:00Z"},{author:{login:"bob"},state:"COMMENTED",submittedAt:"2026-01-02T00:00:00Z"}],comments:[{author:{login:"alice"}}],mergedBy:{login:"alice"},body:"## Change Management\n\n```yaml\ncm-assessment: v1\nimpact: unnoticeable\nrisk: minor\n```\n"}' > "$FIXROOT/T52/pr-5201.json"
+run T52 v2
+{ has 'changeApprovedBy: ["@bob"]' && ! has '@alice' && ! has 'assessmentStatus: needs-review' && [ "$RC" -eq 0 ]; } \
+  && ok "T52 author excluded from own PR (self approve/comment/merge) -> only @bob" || no "T52 author self-exclusion" "$OUT"
+
+# ---------- T53 release aggregate dedups a person who approves multiple PRs and also publishes ----------
+mkfix T53; printf 'fixes #5301 and #5302\n' > "$FIXROOT/T53/release-body.txt"; echo null > "$FIXROOT/T53/published.txt"; printf 'v2\nv1\n' > "$FIXROOT/T53/releases.txt"
+echo 'carol' > "$FIXROOT/T53/release-author.txt"; echo 'Carol Marx' > "$FIXROOT/T53/user-carol.txt"
+jq -n '{author:{login:"alice"},labels:[],reviews:[],comments:[{author:{login:"carol"}}],mergedBy:null,body:"plain"}' > "$FIXROOT/T53/pr-5301.json"
+jq -n '{author:{login:"bob"},labels:[],reviews:[],comments:[{author:{login:"carol"}}],mergedBy:null,body:"plain"}' > "$FIXROOT/T53/pr-5302.json"
+run T53 v2
+{ has 'changeApprovedBy: ["Carol Marx"]' && ! has '"Carol Marx", "Carol Marx"' && [ "$RC" -eq 0 ]; } \
+  && ok "T53 aggregate dedups a multi-PR approver who also publishes" || no "T53 dedup" "$OUT"
 
 # ---------- YAML validity on the core happy-path blocks ----------
 run T1 v2;  { yaml_ok; } && ok "YAML valid (T1)" || no "YAML valid (T1)" "$OUT"

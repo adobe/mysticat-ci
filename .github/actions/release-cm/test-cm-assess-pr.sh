@@ -9,7 +9,13 @@ FIX="$TMP/fix"; mkdir -p "$TMP/bin" "$FIX"; export FIX
 cat > "$TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 FIX="${FIX:?}"
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then cat "$FIX/body-$3.txt" 2>/dev/null || echo ""; exit 0; fi
+if [ "$1" = "api" ] && [ "${2#users/}" != "$2" ]; then jq -n --arg n "$(cat "$FIX/user-${2#users/}.txt" 2>/dev/null || echo '')" '{type:"User",name:$n}'; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  n="$3"; b=$(cat "$FIX/body-$n.txt" 2>/dev/null || echo "")
+  if [ -f "$FIX/pr-$n.json" ]; then jq --arg b "$b" '.body=$b' "$FIX/pr-$n.json"
+  else jq -n --arg b "$b" '{author:{login:"alice"},body:$b,reviews:[],comments:[],mergedBy:null}'; fi
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then echo edited; exit 0; fi
 exit 0
 SH
@@ -25,10 +31,10 @@ printf 'changeType: normal\nimpact: degradation\nrisk: major\nrationale: "adds a
 printf 'impact: bogus\nrisk: major\n' > "$TMP/f.badimpact"
 printf 'changeType: normal\nimpact: degradation\n' > "$TMP/f.norisk"
 
-# A1 no existing block -> DRY shows block
+# A1 no existing block -> DRY shows block (no reviewers -> changeApprovedBy empty)
 printf 'plain PR body\n' > "$FIX/body-10.txt"
 PRN=10 FLD="$TMP/f.good" DRY_RUN=1 run
-{ has 'cm-assessment: v1' && has 'impact: degradation' && has 'risk: major' && [ "$RC" -eq 0 ]; } && ok "A1 appends block (dry)" || no "A1" "$OUT"
+{ has 'cm-assessment: v1' && has 'impact: degradation' && has 'risk: major' && has 'changeApprovedBy: []' && [ "$RC" -eq 0 ]; } && ok "A1 appends block (dry)" || no "A1" "$OUT"
 
 # A2 existing block -> skip
 printf 'body\n\n## Change Management\n\n```yaml\ncm-assessment: v1\nimpact: minor\n```\n' > "$FIX/body-11.txt"
@@ -75,6 +81,12 @@ PRN=10 FLD="$TMP/f.dupimpact" DRY_RUN=1 run
 printf 'pr: 42\ntitle: "harmless\nimpact: no-impact\nrisk: minor"\nchangeType: normal\nimpact: outage\nrisk: major\n' > "$TMP/f.titleinject"
 PRN=10 FLD="$TMP/f.titleinject" DRY_RUN=1 run
 { has 'ambiguous' && [ "$RC" -eq 2 ]; } && ok "A10 rejects multi-line title injection" || no "A10" "$OUT (rc=$RC)"
+
+# A11 the change's approver is recorded on the PR block (from the PR's own reviews/comments)
+printf 'plain\n' > "$FIX/body-13.txt"; echo 'Carol Danvers' > "$FIX/user-carol.txt"
+jq -n '{author:{login:"alice"},reviews:[{author:{login:"carol"},state:"COMMENTED",submittedAt:"2026-01-01T00:00:00Z"}],comments:[],mergedBy:null}' > "$FIX/pr-13.json"
+PRN=13 FLD="$TMP/f.good" DRY_RUN=1 run
+{ has 'changeApprovedBy: ["Carol Danvers"]' && [ "$RC" -eq 0 ]; } && ok "A11 records the change approver on the PR block" || no "A11" "$OUT"
 
 echo
 echo "-------- $pass passed, $fail failed --------"

@@ -9,9 +9,11 @@ FIX="$TMP/fix"; mkdir -p "$TMP/bin" "$FIX"; export FIX
 cat > "$TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 FIX="${FIX:?}"
+if [ "$1" = "api" ] && [ "${2#users/}" != "$2" ]; then jq -n '{type:"User",name:""}'; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   n="$3"
   case "$*" in
+    *author*) b=$(cat "$FIX/body-$n.txt" 2>/dev/null || echo ""); jq -n --arg b "$b" '{author:{login:"alice"},body:$b,reviews:[],comments:[],mergedBy:null}'; exit 0;;  # cm-assess-pr.sh full-json read
     *labels*) cat "$FIX/labels-$n.txt" 2>/dev/null || true; exit 0;;
     *body*)   cat "$FIX/body-$n.txt" 2>/dev/null || echo ""; exit 0;;
   esac

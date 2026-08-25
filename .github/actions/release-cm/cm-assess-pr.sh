@@ -15,6 +15,8 @@
 # Behaviour: appends a fenced `cm-assessment: v1` block under a `## Change Management`
 # heading, preserving the rest of the PR body. Skips if the PR already has a block (a human
 # or earlier run wrote one) unless FORCE=1. Validates impact + risk against the §3.1.1 enums.
+# Also records `changeApprovedBy` — the change's CM approver(s), computed from the PR's own
+# reviews/comments/merge via the shared cm-approvers.sh (same logic release-cm.sh aggregates).
 #
 # The block is rebuilt canonically from the known assessment keys (changeType, impact, risk,
 # rationale) — the input file is NEVER echoed verbatim. Report-only keys (pr, title) and any
@@ -24,6 +26,10 @@
 # Env: REPO (default $GITHUB_REPOSITORY), GH_TOKEN (pull-requests: write), DRY_RUN, FORCE.
 set -euo pipefail
 log_err() { echo "::error::cm-assess-pr: $*" >&2; }
+# Shared change-approver logic (is_bot, verify_person, pr_change_approvers) — same definition
+# release-cm.sh uses, so the PR block's changeApprovedBy matches what the release aggregates.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cm-approvers.sh"
+trap 'rm -f "${CM_PERSON_CACHE:-}"' EXIT
 
 PR="${1:?usage: cm-assess-pr.sh <pr-number> [fields-file]}"
 FILE="${2:-/dev/stdin}"
@@ -67,12 +73,22 @@ case "$imp" in no-impact|unnoticeable|degradation|outage) ;; *) log_err "assessm
 case "$rsk" in minor|major) ;; *) log_err "assessment needs a valid risk (got '${rsk:-none}')"; exit 2;; esac
 case "$ctype" in ""|standard|normal|emergency) ;; *) log_err "assessment has an invalid changeType (got '$ctype')"; exit 2;; esac
 
-body=$(gh pr view "$PR" -R "$REPO" --json body -q .body 2>/dev/null) \
+pr_json=$(gh pr view "$PR" -R "$REPO" --json author,body,reviews,comments,mergedBy 2>/dev/null) \
   || { log_err "cannot read PR #$PR (check pull-requests scope / repo access)"; exit 1; }
+body=$(printf '%s' "$pr_json" | jq -r '.body // ""')
 if printf '%s\n' "$body" | grep -qE '^[[:space:]]*cm-assessment: v1[[:space:]]*$' && [ -z "${FORCE:-}" ]; then
   echo "PR #$PR already has a cm-assessment block — leaving it (set FORCE=1 to add an updated one)"
   exit 0
 fi
+pr_author=$(printf '%s' "$pr_json" | jq -r '.author.login // ""')
+# The change's CM approver(s): non-author human(s) who engaged with this PR and did not object
+# (shared cm-approvers.sh — same logic release-cm.sh aggregates into the release changeApprovedBy).
+# Computed AFTER the idempotent skip so a re-run over an already-decorated PR spends no API calls.
+ca=""
+while IFS=$'\t' read -r _lg _disp; do
+  [ -n "$_lg" ] || continue
+  ca="${ca:+$ca, }$(yamlstr "$_disp")"
+done <<<"$(pr_change_approvers "$pr_json" "$pr_author")"
 
 # Rebuild the block key-by-key from validated/encoded values — never echo the input verbatim.
 block=$(
@@ -80,6 +96,7 @@ block=$(
   [ -n "$ctype" ] && printf 'changeType: %s\n' "$ctype"
   printf 'impact: %s\n' "$imp"
   printf 'risk: %s\n' "$rsk"
+  printf 'changeApprovedBy: [%s]\n' "$ca"
   [ -n "$rat" ] && printf 'rationale: %s\n' "$(yamlstr "$rat")"
   printf '```\n'
 )
