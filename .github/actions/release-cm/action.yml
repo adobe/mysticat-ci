@@ -1,0 +1,23 @@
+name: release-cm
+description: >
+  Append a ServiceNow-CMR-compatible change-management attributes block to the
+  published GitHub release. Reads serviceIds from the consuming repo's .snow.yml.
+  Idempotent (skips a release that already carries the block). Decoration only —
+  makes no ServiceNow API calls.
+inputs:
+  tag:
+    description: >
+      Release tag to decorate. Defaults to the triggering release event's tag;
+      set it explicitly to run from workflow_dispatch or to re-run a specific tag.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Append change-management attributes
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        TAG: ${{ inputs.tag != '' && inputs.tag || github.event.release.tag_name }}
+      run: bash "$GITHUB_ACTION_PATH/release-cm.sh" "$TAG"

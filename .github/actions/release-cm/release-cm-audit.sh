@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Audit / backfill Change Management blocks on a repo's PRODUCTION releases since a date.
+#
+# Usage: release-cm-audit.sh <since-YYYY-MM-DD> <report|suggest|fix>
+#   report   list production releases since <date> that have NO cm-attributes block
+#   suggest  report + show the block release-cm.sh WOULD write (or the failure/needs-review),
+#            without modifying anything
+#   fix      report + actually write the block to each release missing one (idempotent)
+#
+# Env: REPO (default $GITHUB_REPOSITORY); GH_TOKEN (fix needs contents:write, all need
+#      pull-requests:read); SNOW_YML (passed through to release-cm.sh).
+# Reuses release-cm.sh in the same directory as the single source of the block.
+set -euo pipefail
+
+SINCE="${1:?usage: release-cm-audit.sh <since-YYYY-MM-DD> <report|suggest|fix>}"
+MODE="${2:?usage: release-cm-audit.sh <since-YYYY-MM-DD> <report|suggest|fix>}"
+REPO="${REPO:-${GITHUB_REPOSITORY:?REPO or GITHUB_REPOSITORY required}}"
+case "$MODE" in report|suggest|fix) ;; *) echo "::error::mode must be report|suggest|fix (got '$MODE')" >&2; exit 2;; esac
+printf '%s' "$SINCE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || { echo "::error::since must be YYYY-MM-DD (got '$SINCE')" >&2; exit 2; }
+HERE=$(cd "$(dirname "$0")" && pwd)
+RELEASE_CM="$HERE/release-cm.sh"
+[ -f "$RELEASE_CM" ] || { echo "::error::release-cm.sh not found next to the audit script" >&2; exit 2; }
+
+MARKER='^[[:space:]]*cm-attributes: v1[[:space:]]*$'
+
+# Production releases (non-draft, non-prerelease) published on/after SINCE, oldest first.
+releases=$(gh release list -R "$REPO" -L 1000 --json tagName,publishedAt,isDraft,isPrerelease 2>/dev/null \
+  | jq -r --arg s "$SINCE" '
+      [ .[] | select(.isDraft==false and .isPrerelease==false and .publishedAt!=null and (.publishedAt[0:10] >= $s)) ]
+      | sort_by(.publishedAt) | .[] | "\(.tagName)\t\(.publishedAt)"') \
+  || { echo "::error::cannot list releases for $REPO (check GH_TOKEN / repo access)" >&2; exit 1; }
+
+# Optional artifact persistence (RUN=<dir>; OUT_DIR accepted as a legacy alias). The audit
+# COLLECTS facts into the SAME nested layout cmr-report.sh renders, so the whole toolchain
+# shares one scheme: <RUN>/<owner>__<repo>/{repo.yaml, <tag-safe>/release.yaml, <tag-safe>/pr-<n>.yaml}.
+# Render the navigable md tree afterwards with:  cmr-report.sh <RUN> --mode <mode> --since <since>
+RUN="${RUN:-${OUT_DIR:-}}"
+owner_repo=${REPO/\//__}
+repodir="$RUN/$owner_repo"
+if [ -n "$RUN" ]; then
+  mkdir -p "$repodir"
+  [ -f "$repodir/repo.yaml" ] || printf 'repo: %s\nhost: %s\n' "$REPO" "${GH_HOST:-github.com}" > "$repodir/repo.yaml"
+fi
+yamlstr(){ jq -Rn --arg s "$1" '$s'; }   # single-line YAML-safe scalar (matches release-cm.sh)
+
+# Flat, path-safe folder name for a tag: sanitize unsafe chars, and when that changed anything
+# append a short hash of the RAW tag so a sanitized name stays distinct (practically
+# collision-free at repo-tag cardinality — CRC32, not a cryptographic guarantee). Also neutralize
+# `.`/`..` so a folder can never escape the repo dir (git forbids these in a real ref; belt-and-braces).
+tagsafe(){
+  local raw safe
+  raw="$1"; safe=$(printf '%s' "$raw" | sed 's#[^A-Za-z0-9._-]#_#g')
+  [ "$safe" = "$raw" ] || safe="${safe}-$(printf '%s' "$raw" | cksum | cut -d' ' -f1)"
+  case "$safe" in .|..) safe="_${safe}";; esac
+  printf '%s' "$safe"
+}
+
+# Warn (never silently overwrite) if a DIFFERENT tag already owns this folder's release.yaml.
+warn_overwrite(){
+  local existing
+  [ -f "$1/release.yaml" ] || return 0
+  existing=$({ grep -E '^tag:' "$1/release.yaml" || true; } | head -1 | sed -E 's/^tag:[[:space:]]*//; s/^"//; s/"$//')
+  [ -n "$existing" ] && [ "$existing" != "$2" ] && \
+    echo "::warning::release-cm-audit: tags '$2' and '$existing' map to the same folder $(basename "$1") — overwriting" >&2
+  return 0
+}
+
+# Minimal release.yaml (report-mode gap + fallbacks): tag + a status label.
+# NOTE: release.yaml is a re-derived projection, not a hand-edit surface — every run overwrites it.
+write_status(){
+  [ -n "$RUN" ] || return 0
+  local d; d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"; warn_overwrite "$d" "$1"
+  { printf 'tag: %s\n' "$(yamlstr "$1")"; printf 'assessmentStatus: %s\n' "$2"; } > "$d/release.yaml"
+  return 0
+}
+
+# release.yaml (+ per-PR pr-<n>.yaml) parsed from a cm block: $2 is either a release-cm DRY output
+# or a covered release body — both carry a fenced ```yaml``` block whose first line is
+# `cm-attributes: v1`. A pr-<n>.yaml the agent already authored (richer: rationale/title) is kept.
+# NOTE: release.yaml is a re-derived projection, not a hand-edit surface — every run overwrites it.
+write_release(){
+  [ -n "$RUN" ] || return 0
+  local d blk ct im rk st cov f pn pim prk
+  d="$repodir/$(tagsafe "$1")"; mkdir -p "$d"; warn_overwrite "$d" "$1"
+  # Select the fenced yaml block that IS the CM block (first line `cm-attributes: v1`), not merely
+  # the first ```yaml``` in the body — a covered release's notes may carry an earlier yaml block.
+  blk=$(printf '%s\n' "$2" | awk '
+    /```yaml/ { cap=1; first=1; buf=""; ok=0; next }
+    cap && /^[[:space:]]*```/ { if (ok) { printf "%s", buf; exit } cap=0; next }
+    cap { if (first) { first=0; if ($0 ~ /^[[:space:]]*cm-attributes: v1[[:space:]]*$/) ok=1 } buf=buf $0 "\n" }')
+  ct=$({ printf  '%s\n' "$blk" | sed -nE 's/^changeType:[[:space:]]*([a-z]+).*/\1/p'  || true; } | head -1)
+  im=$({ printf  '%s\n' "$blk" | sed -nE 's/^impact:[[:space:]]*([a-z-]+).*/\1/p'      || true; } | head -1)
+  rk=$({ printf  '%s\n' "$blk" | sed -nE 's/^risk:[[:space:]]*([a-z]+).*/\1/p'         || true; } | head -1)
+  st=$({ printf  '%s\n' "$blk" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' || true; } | head -1)
+  cov=$({ printf '%s\n' "$blk" | grep -E '^assessedCoverage:' || true; } | head -1 | sed -E 's/^assessedCoverage:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//')
+  {
+    printf 'tag: %s\n' "$(yamlstr "$1")"
+    if [ -n "$ct" ];  then printf 'changeType: %s\n' "$ct"; fi
+    if [ -n "$im" ];  then printf 'impact: %s\n' "$im"; fi
+    if [ -n "$rk" ];  then printf 'risk: %s\n' "$rk"; fi
+    printf 'assessmentStatus: %s\n' "${st:-unassessed}"
+    if [ -n "$cov" ]; then printf 'coverage: "%s"\n' "$cov"; fi
+  } > "$d/release.yaml"
+  # per-PR rows come from the changes: list (impact/risk only; the agent enriches later)
+  { printf '%s\n' "$blk" | awk '
+      /^changes:/{inc=1;next} !inc{next}
+      /^[[:space:]]*-[[:space:]]*pr:[[:space:]]*[0-9]+/ { if(pr!="")print pr"\t"im"\t"rk; pr=$0; sub(/.*pr:[[:space:]]*/,"",pr); sub(/[^0-9].*/,"",pr); im=""; rk=""; next }
+      /^[[:space:]]*impact:/ { s=$0; sub(/^[[:space:]]*impact:[[:space:]]*/,"",s); sub(/[[:space:]#].*$/,"",s); im=s; next }
+      /^[[:space:]]*risk:/   { s=$0; sub(/^[[:space:]]*risk:[[:space:]]*/,"",s);   sub(/[[:space:]#].*$/,"",s); rk=s; next }
+      END{ if(pr!="")print pr"\t"im"\t"rk }' ; } | while IFS=$'\t' read -r pn pim prk; do
+    [ -n "$pn" ] || continue
+    f="$d/pr-$pn.yaml"
+    if [ -f "$f" ]; then continue; fi
+    {
+      printf 'pr: %s\n' "$pn"
+      if [ -n "$pim" ]; then printf 'impact: %s\n' "$pim"; fi
+      if [ -n "$prk" ]; then printf 'risk: %s\n' "$prk"; fi
+    } > "$f"
+  done
+  return 0
+}
+
+# assessmentStatus from a release-cm block ($1); a per-tag FAILED line + bookkeeping (uses the
+# loop-scoped tag/day/failed, as write_status/write_release use repodir).
+extract_status(){ printf '%s\n' "$1" | sed -nE 's/^assessmentStatus:[[:space:]]*([a-z-]+).*/\1/p' | head -1; }
+fail_tag(){
+  echo "FAILED   $tag  $day  — $(printf '%s\n' "$1" | grep -m1 '::error::' | sed 's/.*::error::release-cm: //')"
+  failed=$((failed + 1)); write_status "$tag" failed
+}
+
+total=0; covered=0; gap=0; suggested=0; needsreview=0; fixed=0; failed=0
+echo "== release-cm-audit  repo=$REPO  since=$SINCE  mode=$MODE =="
+
+while IFS=$'\t' read -r tag published; do
+  [ -n "$tag" ] || continue
+  total=$((total + 1))
+  day=${published%%T*}
+  body=$(gh release view "$tag" -R "$REPO" --json body -q .body 2>/dev/null || true)
+  if printf '%s\n' "$body" | grep -qE "$MARKER"; then
+    # already decorated — record the real block's values (not a bare "covered" label), untouched
+    covered=$((covered + 1)); write_release "$tag" "$body"; continue
+  fi
+  gap=$((gap + 1))
+  case "$MODE" in
+    report)
+      echo "GAP      $tag  $day  — no CM block"; write_status "$tag" gap
+      ;;
+    suggest)
+      if out=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
+        st=$(extract_status "$out")
+        echo "SUGGEST  $tag  $day  assessmentStatus=${st:-?}"
+        printf '%s\n' "$out" | awk '/```yaml/{f=1;print "    "$0;next} f&&/^```/{print "    "$0;exit} f{print "    "$0}'
+        suggested=$((suggested + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
+        write_release "$tag" "$out"
+      else
+        fail_tag "$out"
+      fi
+      ;;
+    fix)
+      # Capture the block from a DRY pass BEFORE the real edit — afterwards the live body already
+      # carries the block and DRY would short-circuit on the idempotency guard (no block emitted).
+      if dry=$(DRY_RUN=1 REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
+        st=$(extract_status "$dry")
+        if out=$(REPO="$REPO" bash "$RELEASE_CM" "$tag" 2>&1); then
+          echo "FIXED    $tag  $day  ${st:+assessmentStatus=$st}"
+          fixed=$((fixed + 1)); [ "$st" = needs-review ] && needsreview=$((needsreview + 1))
+          write_release "$tag" "$dry"
+        else
+          fail_tag "$out"
+        fi
+      else
+        fail_tag "$dry"
+      fi
+      ;;
+  esac
+done <<<"$releases"
+
+echo "-- ${total} production release(s) since ${SINCE}: ${covered} already covered, ${gap} missing a CM block --"
+case "$MODE" in
+  suggest) echo "-- suggested ${suggested} (of which ${needsreview} need review), ${failed} could not be generated --";;
+  fix)     echo "-- fixed ${fixed} (of which ${needsreview} need review), ${failed} could not be generated --";;
+esac
+[ -n "$RUN" ] && echo "-- data written to ${repodir}/ — render the tree with: cmr-report.sh ${RUN} --mode ${MODE} --since ${SINCE} --"
+# fix mode signals a non-zero exit if any release could not be backfilled, so CI shows red.
+[ "$MODE" = fix ] && [ "$failed" -gt 0 ] && exit 1
+exit 0

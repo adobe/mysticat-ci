@@ -1,0 +1,19 @@
+name: release-cm-audit
+description: Audit or backfill Change Management blocks on a repo's production releases since a date.
+inputs:
+  since:
+    description: Validate releases published on/after this date (YYYY-MM-DD).
+    required: true
+  mode:
+    description: "report (list gaps) | suggest (show the proposed block) | fix (write it)."
+    required: true
+    default: report
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+      # Reuses release-cm.sh from the sibling action dir (whole repo is checked out at the ref).
+      run: bash "$GITHUB_ACTION_PATH/../release-cm/release-cm-audit.sh" "${{ inputs.since }}" "${{ inputs.mode }}"

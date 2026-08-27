@@ -1,0 +1,30 @@
+name: test-release-cm
+
+# Run the release-cm regression suite whenever the action changes.
+on:
+  pull_request:
+    paths:
+      - .github/actions/release-cm/**
+      - .github/workflows/test-release-cm.yaml
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/release-cm/**
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: release-cm unit tests
+        run: bash .github/actions/release-cm/test-release-cm.sh   # needs bash + jq (preinstalled)
+      - name: release-cm-audit unit tests
+        run: bash .github/actions/release-cm/test-release-cm-audit.sh
+      - name: cm-assess-pr unit tests
+        run: bash .github/actions/release-cm/test-cm-assess-pr.sh
+      - name: cm-assess-pr-auto unit tests
+        run: bash .github/actions/release-cm/test-cm-assess-pr-auto.sh
+      - name: cmr-report unit tests
+        run: bash .github/actions/release-cm/test-cmr-report.sh
