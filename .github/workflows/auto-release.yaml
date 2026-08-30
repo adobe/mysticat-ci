@@ -1,0 +1,414 @@
+name: Auto Release
+
+# Publishes a GitHub Release on every meaningful merge to main and moves the
+# floating vN tag inline. release.yaml stays as the path for manual Releases
+# (human-published via the GitHub UI). The two triggers are disjoint:
+# this workflow runs on `push: main` under GITHUB_TOKEN (which by GitHub's
+# anti-recursion rule cannot trigger another workflow_run), release.yaml
+# runs on `release: published` from a real user. They never both fire on
+# the same event, so there's no double-write to refs/tags/vN.
+#
+# Bump rules (from the merged PR's title + body, or merge subject as fallback):
+#   feat!: / fix!: / <type>(scope)!:                          -> major
+#   "BREAKING CHANGE:" / "BREAKING-CHANGE:" footer in PR body -> major
+#   feat: / feat(scope):                                      -> minor
+#   anything else                                             -> patch
+# Footer detection is anchored to the LAST paragraph of the PR body only
+# (per conventional-commits spec), so quoted prose mentions don't trigger.
+#
+# Suppress with [skip release] as a TRAILER — must appear on its own line
+# in the merge commit message, or be the entire (trimmed) PR title.
+# Prose mentions like `docs: explain how [skip release] works` will NOT
+# match. Case-insensitive.
+#
+# This workflow publishes against the LATEST major line only. Maintenance
+# releases on older lines (e.g. v1.x.x after v2 ships) must be cut manually
+# via `gh release create` from a maintainer's machine; release.yaml then
+# moves vN-1 correctly because human-published Releases DO trigger
+# workflow_run events.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        # SHA-pinned (v6.0.2). fetch-depth: 1 is intentional — we only need
+        # HEAD; tags come from the explicit `git fetch --tags` below.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Compute next tag
+        id: t
+        env:
+          # Untrusted webhook data via env (never inline ${{ }} in run).
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # --prune-tags so a tag force-deleted on origin (after a bad-release
+          # recovery) doesn't linger locally and send us down the reuse path.
+          git fetch --force --prune --prune-tags --tags origin >/dev/null
+
+          # ---- helpers ----------------------------------------------------
+
+          # Scrub all colons (not just ::) before any echo of untrusted text.
+          # Order matters: tr -d newlines FIRST, then tr ':' '_', then cut by
+          # bytes. Reversing the order could let a multibyte slice leave a
+          # stray colon at the boundary. Do not reorder.
+          sanitize() {
+            printf '%s' "${1-}" | tr -d '\r\n' | tr ':' '_' | cut -c1-200
+          }
+
+          # Retry $* up to 3 times with linear backoff (5s, 10s). Captures
+          # stdout for the caller via $(retry ...). Exit non-zero if all fail.
+          retry() {
+            local i
+            for i in 1 2 3; do
+              if "$@"; then return 0; fi
+              [ "$i" -lt 3 ] && sleep $((i * 5))
+            done
+            return 1
+          }
+
+          # Trailer-anchored [skip release] match. Must appear as its own
+          # line (a git trailer) or as the entire trimmed PR title — NOT in
+          # the middle of prose. Rejects `docs: explain how [skip release]
+          # works` while still accepting `feat: foo\n\n[skip release]`
+          # (multi-line commit body trailer) and the bare-token PR title
+          # `[skip release]`. Case-insensitive. Grep processes input
+          # line-by-line so `^`/`$` are per-line anchors here.
+          matches_skip() {
+            printf '%s\n' "${1-}" \
+              | grep -qiE '^[[:space:]]*\[skip[[:space:]]+release\][[:space:]]*$'
+          }
+
+          # ---- SHA-keyed idempotency --------------------------------------
+
+          # If a semver tag already points at this commit, reuse it.
+          # Don't short-circuit — let the publish step retry the vN move.
+          EXISTING_TAG=$(git tag --points-at "$TARGET_SHA" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          if [ -n "$EXISTING_TAG" ]; then
+            echo "::notice::Reconciling vN: commit already tagged $(sanitize "$EXISTING_TAG")"
+            { echo "tag=$EXISTING_TAG"; echo "bump=reuse"; echo "skip=false"; \
+              echo "bump_source=existing tag"; echo "bump_subject=$(sanitize "$EXISTING_TAG")"; \
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- latest semver tag ------------------------------------------
+
+          # `|| true` here is load-bearing: without it, grep returning 1
+          # (no semver tags) plus pipefail aborts via set -e before the
+          # explicit empty-check below runs, swallowing the error message.
+          LATEST=$(git tag -l --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          [ -n "$LATEST" ] || { echo "::error::no vN.N.N tag in repo (seed with 'gh release create v0.1.0 --target main' first)"; exit 1; }
+          MAJOR=$(echo "$LATEST" | sed -E 's/^v([0-9]+)\..*/\1/')
+          MINOR=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.([0-9]+)\..*/\1/')
+          PATCH=$(echo "$LATEST" | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/')
+
+          # ---- resolve PR ------------------------------------------------
+
+          # Resolve the PR by SHA (NOT by parsing the commit message —
+          # spoofable). Strict filter on merge_commit_sha + base.ref so a
+          # commit cherry-picked into multiple branches doesn't let the
+          # wrong PR's title drive the bump.
+          #
+          # Split into "fetch" and "parse" so we can distinguish:
+          #   (a) API succeeded, no PR matched — legitimate direct push;
+          #       fall back to head commit subject (safe patch bump).
+          #   (b) API failed transiently — must NOT silently fall back,
+          #       or a feat!: PR ships as patch during a 30s API outage.
+          if ! COMMITS_JSON=$(retry gh api "/repos/$REPO/commits/$TARGET_SHA/pulls" 2>/dev/null); then
+            echo "::error::Failed to list PRs for $TARGET_SHA after 3 attempts"
+            exit 1
+          fi
+          PR_NUM=$(printf '%s' "$COMMITS_JSON" \
+            | jq -r --arg sha "$TARGET_SHA" \
+                '.[] | select(.merged_at != null and .merge_commit_sha == $sha and .base.ref == "main") | .number' \
+            | head -1 || true)
+
+          PR_TITLE=""
+          PR_BODY=""
+          if [ -n "$PR_NUM" ]; then
+            # Retry transient API failures. We do NOT silently fall back to
+            # the merge subject — that would silently downgrade a feat!: PR
+            # to a patch release during a 30-second API blip.
+            if PR_JSON=$(retry gh pr view "$PR_NUM" --repo "$REPO" \
+                --json title,body 2>/dev/null); then
+              PR_TITLE=$(printf '%s' "$PR_JSON" | jq -r '.title // ""')
+              PR_BODY=$(printf '%s' "$PR_JSON"  | jq -r '.body  // ""')
+            else
+              echo "::error::gh pr view #$PR_NUM failed after 3 attempts"
+              exit 1
+            fi
+            if [ -z "$PR_TITLE" ]; then
+              echo "::error::PR #$PR_NUM has empty title"
+              exit 1
+            fi
+            BUMP_SUBJECT="$PR_TITLE"
+            BUMP_SOURCE="PR #$PR_NUM title"
+          else
+            # Direct push to main (no PR). Rare; warn loudly so operators
+            # see the fallback path in the run log.
+            BUMP_SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MSG" | head -1)
+            BUMP_SOURCE="head commit subject (no PR found)"
+            echo "::warning::No merged PR found for $TARGET_SHA; using head commit subject for bump"
+          fi
+
+          SAFE_SUBJECT=$(sanitize "$BUMP_SUBJECT")
+
+          # ---- [skip release] gate ---------------------------------------
+
+          if matches_skip "$HEAD_COMMIT_MSG" || matches_skip "$PR_TITLE"; then
+            echo "::notice::Release suppressed by [skip release] marker"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- BREAKING CHANGE footer (anchored to last paragraph) -------
+
+          # Per conventional-commits spec, BREAKING CHANGE: is a FOOTER —
+          # it must appear in the last paragraph of the body. awk in
+          # paragraph mode (RS="") returns only the final block.
+          BREAKING_FOOTER=""
+          if [ -n "$PR_BODY" ]; then
+            LAST_PARA=$(printf '%s' "$PR_BODY" | awk 'BEGIN{RS=""} END{print}')
+            if printf '%s' "$LAST_PARA" | grep -qE '^BREAKING[ -]CHANGE:'; then
+              BREAKING_FOOTER=1
+            fi
+          fi
+
+          # ---- bump decision ---------------------------------------------
+
+          if printf '%s' "$BUMP_SUBJECT" | grep -qE '^[a-z]+(\([^)]+\))?!:'; then
+            NEXT="v$((MAJOR+1)).0.0"; BUMP=major
+          elif [ -n "$BREAKING_FOOTER" ]; then
+            NEXT="v$((MAJOR+1)).0.0"; BUMP=major
+          elif printf '%s' "$BUMP_SUBJECT" | grep -qE '^feat(\([^)]+\))?:'; then
+            NEXT="v$MAJOR.$((MINOR+1)).0"; BUMP=minor
+          else
+            NEXT="v$MAJOR.$MINOR.$((PATCH+1))"; BUMP=patch
+            # Near-miss: title looks conventional but didn't match the strict regex.
+            if printf '%s' "$BUMP_SUBJECT" | grep -qiE '^[[:space:]]*(feat|fix|chore|docs|test|style|refactor|perf|build|ci|revert)' \
+               && ! printf '%s' "$BUMP_SUBJECT" | grep -qE '^(feat|fix|chore|docs|test|style|refactor|perf|build|ci|revert)(\([^)]+\))?!?:'; then
+              echo "::warning::Near-miss conventional prefix in \"$SAFE_SUBJECT\" — collapsed to patch"
+            fi
+          fi
+
+          # Loud signal on major bumps — consumers pinned to @v$MAJOR don't
+          # auto-roll to v$((MAJOR+1)); they must manually update `uses:` refs.
+          if [ "$BUMP" = "major" ]; then
+            echo "::warning::MAJOR bump $LATEST -> $NEXT: consumers pinned to v$MAJOR are NOT updated and must bump their 'uses:' refs manually."
+          fi
+
+          { echo "tag=$NEXT"; echo "bump=$BUMP"; echo "skip=false"; \
+            echo "bump_source=$BUMP_SOURCE"; echo "bump_subject=$SAFE_SUBJECT"; \
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::$LATEST -> $NEXT ($BUMP) from $BUMP_SOURCE: \"$SAFE_SUBJECT\""
+
+      - name: Publish release and move floating tag
+        # success() short-circuits if a prior step failed — without it, a
+        # custom `if:` re-enables the step even when the compute step errored.
+        if: success() && steps.t.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_TAG: ${{ steps.t.outputs.tag }}
+          BUMP: ${{ steps.t.outputs.bump }}
+          BUMP_SOURCE: ${{ steps.t.outputs.bump_source }}
+          BUMP_SUBJECT: ${{ steps.t.outputs.bump_subject }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Same helpers as the compute step — re-defined because run blocks
+          # don't share scope. Keep them in sync.
+          sanitize() {
+            printf '%s' "${1-}" | tr -d '\r\n' | tr ':' '_' | cut -c1-200
+          }
+          retry() {
+            local i
+            for i in 1 2 3; do
+              if "$@"; then return 0; fi
+              [ "$i" -lt 3 ] && sleep $((i * 5))
+            done
+            return 1
+          }
+
+          # Defense-in-depth: real regex match (not shell glob).
+          if ! printf '%s' "$NEXT_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::malformed NEXT_TAG: $(sanitize "$NEXT_TAG")"; exit 1
+          fi
+
+          # Idempotent create. `gh release view` not wrapped in retry —
+          # "not found" is a normal outcome (we'd then create), and retrying
+          # would add 15s of dead time to every happy-path release.
+          if gh release view "$NEXT_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # Release exists; tag MUST also exist. Retry the tag-SHA read.
+            TAG_SHA=$(retry gh api "/repos/$REPO/git/ref/tags/$NEXT_TAG" \
+              --jq .object.sha 2>/dev/null || echo "")
+            # Empty TAG_SHA means the read failed transiently (the release was
+            # just confirmed to exist on line 266, so the tag must too). Fail
+            # loud as a transient error — do NOT fall through to the equality
+            # check, which would emit a misleading "Drift detected" pointing the
+            # operator at a phantom consistency problem instead of a re-run.
+            if [ -z "$TAG_SHA" ]; then
+              echo "::error::Failed to read tag SHA for $NEXT_TAG after 3 attempts (transient API failure). Re-run should resolve."
+              exit 1
+            fi
+            if [ "$TAG_SHA" = "$TARGET_SHA" ]; then
+              echo "Release $NEXT_TAG already exists at $TARGET_SHA — skipping create."
+            else
+              echo "::error::Tag $NEXT_TAG exists at $(sanitize "$TAG_SHA"), expected $TARGET_SHA. Drift detected."
+              exit 1
+            fi
+          else
+            # Not retried: gh release create is non-idempotent enough that a
+            # transient-but-server-side-succeeded first call would make the
+            # retry fail with "already exists." Single attempt; operator
+            # re-runs the workflow if needed (the reuse path handles it).
+            gh release create "$NEXT_TAG" --repo "$REPO" \
+              --target "$TARGET_SHA" --title "$NEXT_TAG" --generate-notes
+          fi
+
+          # vN move. GITHUB_TOKEN-published Releases don't trigger workflow_run,
+          # so release.yaml never fires here. We move the tag inline instead.
+          # /git/ref/tags/X is exact match; /git/refs/tags/X is prefix match.
+          MAJOR_TAG=$(echo "$NEXT_TAG" | grep -oE '^v[0-9]+' || true)
+          [ -n "$MAJOR_TAG" ] || { echo "::error::bad NEXT_TAG: $(sanitize "$NEXT_TAG")"; exit 1; }
+
+          # Forward-only vN guard. If a higher semver tag exists on this
+          # major line than NEXT_TAG, this is a re-run of a superseded
+          # release — moving vN to TARGET_SHA would regress consumers
+          # pinned to @vN. Skip the move, but the release object itself
+          # is preserved (we already validated it exists at TARGET_SHA).
+          git fetch --force --prune --prune-tags --tags origin >/dev/null
+          HIGHEST_ON_LINE=$(git tag -l --sort=-v:refname \
+            | grep -E "^${MAJOR_TAG}\.[0-9]+\.[0-9]+$" | head -1 || true)
+          if [ -n "$HIGHEST_ON_LINE" ] && [ "$HIGHEST_ON_LINE" != "$NEXT_TAG" ]; then
+            # Is HIGHEST_ON_LINE actually higher than NEXT_TAG? sort -V tells us.
+            HIGHER=$(printf '%s\n%s\n' "$NEXT_TAG" "$HIGHEST_ON_LINE" | sort -V | tail -1)
+            if [ "$HIGHER" = "$HIGHEST_ON_LINE" ]; then
+              echo "::warning::Skipping $MAJOR_TAG move: $HIGHEST_ON_LINE already exists (higher than $NEXT_TAG). vN moves forward-only; this is likely a re-run of a superseded release."
+              echo "Release $NEXT_TAG is intact; only the floating tag was skipped."
+              # Step summary still useful for audit.
+              {
+                echo "## Released $NEXT_TAG ($BUMP) — vN move skipped"
+                echo
+                echo "- Target SHA: \`$TARGET_SHA\`"
+                echo "- Skipped $MAJOR_TAG move: a higher release ($HIGHEST_ON_LINE) already exists on this line."
+                echo "- The release object for $NEXT_TAG is preserved; only the floating $MAJOR_TAG tag was not moved (it points at the newer release)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+
+          # Capture previous vN target SHA for the rollback path. Single
+          # attempt — first-ever-major-tag legitimately 404s and we'd
+          # otherwise waste 15s before falling through to the POST path.
+          PREV_VN_SHA=$(gh api "/repos/$REPO/git/ref/tags/$MAJOR_TAG" \
+            --jq .object.sha 2>/dev/null || echo "")
+
+          # No-op detection: if PREV_VN_SHA == TARGET_SHA, vN already points
+          # at our target (reconcile re-run of the currently-published
+          # release). Read-back will succeed but the rollback breadcrumb
+          # would be a roll-to-self command. Skip emitting it.
+          if [ "$PREV_VN_SHA" = "$TARGET_SHA" ]; then
+            echo "$MAJOR_TAG already at $TARGET_SHA — no move needed."
+            NOOP_MOVE=1
+          else
+            NOOP_MOVE=0
+            echo "Moving $MAJOR_TAG -> $TARGET_SHA (was: ${PREV_VN_SHA:-<unset>})"
+            if [ -n "$PREV_VN_SHA" ]; then
+              retry gh api -X PATCH "/repos/$REPO/git/refs/tags/$MAJOR_TAG" \
+                -f sha="$TARGET_SHA" -F force=true
+            else
+              retry gh api -X POST "/repos/$REPO/git/refs" \
+                -f ref="refs/tags/$MAJOR_TAG" -f sha="$TARGET_SHA"
+            fi
+          fi
+
+          # Read-back: confirm vN actually resolves to TARGET_SHA. Catches
+          # silent rejects (tag protection returning 200) and ref-update races.
+          ACTUAL_SHA=$(retry gh api "/repos/$REPO/git/ref/tags/$MAJOR_TAG" \
+            --jq .object.sha)
+          [ "$ACTUAL_SHA" = "$TARGET_SHA" ] || {
+            echo "::error::$MAJOR_TAG points at $(sanitize "$ACTUAL_SHA"), expected $TARGET_SHA"
+            exit 1
+          }
+          echo "Verified: $MAJOR_TAG -> $ACTUAL_SHA"
+
+          # Emit rollback only when there was an actual move with a real
+          # previous SHA distinct from TARGET_SHA. Otherwise the command
+          # would be a roll-to-self no-op, which is misleading at 3am.
+          if [ -n "$PREV_VN_SHA" ] && [ "$NOOP_MOVE" = "0" ]; then
+            echo "::notice::Rollback: gh api -X PATCH /repos/$REPO/git/refs/tags/$MAJOR_TAG -f sha=$PREV_VN_SHA -F force=true"
+          fi
+
+          # Step summary — one-screen post-mortem artifact. SHAs and the
+          # already-sanitized bump_subject only; no further untrusted text.
+          # Rollback block only emitted when there was a real move (not
+          # a reconcile re-run that landed on the same SHA).
+          {
+            echo "## Released $NEXT_TAG ($BUMP)"
+            echo
+            echo "- Target SHA: \`$TARGET_SHA\`"
+            echo "- Bump source: $BUMP_SOURCE"
+            echo "- Subject: \`$BUMP_SUBJECT\`"
+            if [ "$NOOP_MOVE" = "1" ]; then
+              echo "- Floating tag $MAJOR_TAG: already at \`$ACTUAL_SHA\` (no move needed)"
+            else
+              echo "- Floating tag $MAJOR_TAG: \`${PREV_VN_SHA:-<unset>}\` -> \`$ACTUAL_SHA\`"
+            fi
+            if [ -n "$PREV_VN_SHA" ] && [ "$NOOP_MOVE" = "0" ]; then
+              echo
+              echo "### Rollback"
+              echo
+              echo '```bash'
+              echo "gh api -X PATCH /repos/$REPO/git/refs/tags/$MAJOR_TAG -f sha=$PREV_VN_SHA -F force=true"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          NEXT_TAG: ${{ steps.t.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Auto Release FAILED"
+            echo
+            echo "- Commit: \`${TARGET_SHA}\`"
+            echo "- Computed tag: \`${NEXT_TAG:-<not computed>}\`"
+            echo "- Run: ${RUN_URL}"
+            echo
+            echo "Common causes:"
+            echo "- Transient GitHub API failure (re-run usually resolves it)"
+            echo "- Tag protection rule rejecting the vN force-update"
+            echo "- A semver tag at this commit was created out-of-band, then the Release for it was deleted"
+            echo
+            echo "Until this re-runs successfully, consumers pinned to @vN will NOT see this commit."
+          } >> "$GITHUB_STEP_SUMMARY"
