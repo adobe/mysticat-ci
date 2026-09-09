@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
-# should-run-heavy.sh — decide whether THIS invocation runs the heavy CI path
-# (build + it-postgres), or lets its push/PR twin cover it.
+# should-run-heavy.sh — an illustrative, unit-tested MODEL of the push/PR dedup
+# decision: whether THIS invocation runs the heavy CI path (build + it-postgres)
+# or lets its push/PR twin cover it.
 #
-# This is the authoritative, unit-tested spec for the push/PR dedup. The
-# reusable workflow cannot run bash before it schedules a job (a job-level `if:`
-# is evaluated pre-scheduling, and only relieving a runner slot pre-scheduling
-# actually helps the org's concurrency pressure — a job that spins up just to
-# decide "skip" has already taken its slot). So service-ci.yaml transcribes this
-# decision into the `build` / `it-postgres` job `if:` expressions, and
-# test-service-ci-dedup.sh pins those expressions to this matrix so the two
-# cannot drift. Keep this script and those `if:` guards in lockstep.
+# NOT the runtime authority. The reusable workflow cannot run bash before it
+# schedules a job (a job-level `if:` is evaluated pre-scheduling, and only
+# relieving a runner slot pre-scheduling actually helps the org's concurrency
+# pressure — a job that spins up just to decide "skip" has already taken its
+# slot). So the authoritative decision AT RUNTIME is the declarative `build` /
+# `it-postgres` job `if:` in service-ci.yaml. This script is an executable
+# statement of the same decision, kept readable and regression-tested
+# (test-should-run-heavy.sh) because getting it wrong caused a prod incident
+# (spacecat-api-service#3235).
+#
+# Two drift facts, stated honestly (do not overclaim "cannot drift"):
+#   - test-service-ci-dedup.sh pins the YAML `if:` strings to a hardcoded CLAUSE
+#     literal (MACHINE-enforced): a YAML `if:` edit that diverges fails CI.
+#   - This script's equivalence to that YAML `if:` is maintained by REVIEW, not
+#     by a check — a GitHub-expression evaluator in bash is impractical, so
+#     editing the logic here does NOT automatically flag a now-stale YAML. If you
+#     change the decision, update all three together: this script, the `build` /
+#     `it-postgres` `if:` in service-ci.yaml, and CLAUSE in test-service-ci-dedup.sh.
 #
 # Inputs (env):
 #   DEDUP_ENABLED  "true" to dedup; anything else = off (today's behavior)

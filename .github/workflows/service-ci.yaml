@@ -151,10 +151,12 @@ jobs:
 
   build:
     # Heavy path (dedup): run unless this is the redundant same-repo
-    # pull_request copy and dedup-pr-runs is on. Authoritative decision spec +
-    # tests in .github/actions/ci-context/ (should-run-heavy.sh); this `if:` is
-    # its transcription and is pinned to it by test-service-ci-dedup.sh. When
-    # dedup-pr-runs is false (default) this is always true — no behavior change.
+    # pull_request copy and dedup-pr-runs is on. THIS `if:` is the authoritative
+    # runtime decision; test-service-ci-dedup.sh pins it against drift. The truth
+    # table + rationale live in .github/actions/ci-context/ (should-run-heavy.sh
+    # is a readable model of this expression, kept in sync by review — not the
+    # runtime decider). When dedup-pr-runs is false (default) this is always
+    # true — no behavior change.
     if: "!inputs.dedup-pr-runs || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository"
     runs-on: ubuntu-latest
     steps:
