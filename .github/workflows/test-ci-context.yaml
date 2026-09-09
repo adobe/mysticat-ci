@@ -1,0 +1,27 @@
+name: test-ci-context
+
+# Run the CI-context / push-PR-dedup regression suite whenever the decision
+# spec, its tests, or the service-ci workflow it is pinned to changes.
+on:
+  pull_request:
+    paths:
+      - .github/actions/ci-context/**
+      - .github/workflows/service-ci.yaml
+      - .github/workflows/test-ci-context.yaml
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/ci-context/**
+      - .github/workflows/service-ci.yaml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: should-run-heavy decision matrix
+        run: bash .github/actions/ci-context/test-should-run-heavy.sh   # needs bash (preinstalled)
+      - name: service-ci dedup wiring (golden / drift guard)
+        run: bash .github/actions/ci-context/test-service-ci-dedup.sh

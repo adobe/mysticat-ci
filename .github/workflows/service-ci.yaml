@@ -29,6 +29,25 @@ on:
         description: "Run PostgreSQL (v3) integration tests after build (requires ECR access)"
         default: false
         type: boolean
+      dedup-pr-runs:
+        description: >
+          Opt in to de-duplicating the heavy path (build + it-postgres) across
+          the push and pull_request events. For an open same-repo PR, GitHub
+          fires both a push (refs/heads/<branch>) and a pull_request
+          (refs/pull/N/merge) on every commit; the concurrency group keys on
+          github.ref so they never cancel, and the heavy jobs run twice. When
+          true, the redundant SAME-REPO pull_request copy of build+it-postgres
+          is skipped — the branch's push run already runs them on the same head
+          SHA and reports the required checks there. The push run is never
+          skipped, so branch-deploy (feature branches) and semantic-release /
+          deploy (main) keep their gates; fork PRs still run the heavy path on
+          pull_request because they have no base-repo push twin. Decision spec
+          and tests: .github/actions/ci-context/. Defaults false so existing
+          callers are unaffected. PREREQUISITE before flipping true on a repo:
+          confirm on one live PR that the branch-protection required checks
+          (ci / build, ci / it-postgres) still report green from the push run.
+        default: false
+        type: boolean
       bundle-build:
         description: >
           Opt in to a Lambda bundle smoke check via `npm run build`
@@ -131,6 +150,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
+    # Heavy path (dedup): run unless this is the redundant same-repo
+    # pull_request copy and dedup-pr-runs is on. Authoritative decision spec +
+    # tests in .github/actions/ci-context/ (should-run-heavy.sh); this `if:` is
+    # its transcription and is pinned to it by test-service-ci-dedup.sh. When
+    # dedup-pr-runs is false (default) this is always true — no behavior change.
+    if: "!inputs.dedup-pr-runs || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository"
     runs-on: ubuntu-latest
     steps:
       - name: Check out
@@ -197,7 +222,12 @@ jobs:
     # it. Running it in parallel with `build` instead of after it roughly
     # halves PR wall-clock time (build and it-postgres are each ~5-7min;
     # sequential means paying both, parallel means paying the slower one).
-    if: inputs.it-postgres
+    #
+    # The trailing clause is the same push/PR dedup guard as `build` (see
+    # .github/actions/ci-context/, pinned by test-service-ci-dedup.sh): skip the
+    # redundant same-repo pull_request copy when dedup-pr-runs is on. Default off
+    # keeps the plain `inputs.it-postgres` behavior.
+    if: "inputs.it-postgres && (!inputs.dedup-pr-runs || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)"
     timeout-minutes: 15
     steps:
       - name: Check out
