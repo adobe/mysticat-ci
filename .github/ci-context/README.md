@@ -54,6 +54,20 @@ the redundant **same-repo pull_request** copy of the heavy path is skippable;
 fork PRs keep running it because they have no base-repo push twin. `T4`/`T5` in
 `test-service-ci-dedup.sh` are permanent regression guards for this.
 
+## Observability: the `dedup-notice` breadcrumb
+
+When the dedup skips `build` + `it-postgres` on a same-repo `pull_request` run,
+those checks show as `skipped` on the PR with no hint of where the real run is.
+The `dedup-notice` job in `service-ci.yaml` closes that gap: it runs in exactly
+the deduped case (the De Morgan negation of the heavy-path `if:` - dedup on AND
+`pull_request` AND same-repo) and prints a `::notice` annotation stating that
+`build` + `it-postgres` run on the branch's `push` event for the same commit and
+report the required checks there. So a developer reads "expected, covered by the
+push run" rather than suspecting a silent failure. It is not a required check, it
+never runs when dedup is off (the default) or on a `push`/`workflow_dispatch`/fork
+PR, and it is pinned by `T6` in `test-service-ci-dedup.sh` (mutation-tested to
+fail closed if the job is removed or its gate broadened).
+
 ## Enabling it on a consumer (opt-in)
 
 `dedup-pr-runs` defaults **false**, so nothing changes until a repo passes

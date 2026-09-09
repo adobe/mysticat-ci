@@ -14,7 +14,7 @@
 # review, not by this test.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-YAML="$HERE/../../workflows/service-ci.yaml"
+YAML="$HERE/../workflows/service-ci.yaml"
 
 pass=0; fail=0
 ok(){ printf 'PASS  %s\n' "$1"; pass=$((pass+1)); }
@@ -72,6 +72,33 @@ else
     *dedup-pr-runs*) no "T5" "branch-deploy if references dedup-pr-runs: $bd_if" ;;
     *) ok "T5 branch-deploy job-level if: is independent of dedup" ;;
   esac
+fi
+
+# T6 OBSERVABILITY BREADCRUMB: a `dedup-notice` job must surface a notice on the
+#    same-repo `pull_request` run whose heavy path was deduped, so a developer
+#    seeing `ci / build` + `ci / it-postgres` as `skipped` knows the push run
+#    covers them (not a silent failure). Its `if:` is the De Morgan negation of
+#    CLAUSE -- it runs in exactly the case the heavy jobs skip: dedup on AND
+#    pull_request AND same-repo. If you change CLAUSE, change this in lockstep.
+SKIP_CLAUSE="inputs.dedup-pr-runs && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository"
+if has 'dedup-notice:' && has "    if: \"$SKIP_CLAUSE\""; then
+  # Scope the payload check to the dedup-notice JOB BLOCK and require the emitted
+  # command (`echo "::notice`), NOT a bare `::notice` anywhere in the file: the
+  # job's own comment contains the word `::notice`, so a whole-file grep
+  # false-passes when the echo is removed (mutation testing caught exactly this).
+  # Extract from the job header to the next 2-space job header.
+  notice_block=$(awk '
+    /^  dedup-notice:/ {f=1; print; next}
+    f && /^  [a-z]/    {exit}          # next job header -> stop
+    f                  {print}
+  ' "$YAML")
+  if printf '%s\n' "$notice_block" | grep -qF 'echo "::notice'; then
+    ok "T6 dedup-notice job present, gated to the deduped case, emits a ::notice"
+  else
+    no "T6" "dedup-notice job present but its step emits no ::notice breadcrumb"
+  fi
+else
+  no "T6" "dedup-notice missing or its if: != skip clause (De Morgan negation of CLAUSE)"
 fi
 
 echo
